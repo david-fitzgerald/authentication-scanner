@@ -1174,9 +1174,11 @@ def stage5_comparison(metrics, hires=False, model_name="vitb14", entropy=False):
 # ---------------------------------------------------------------------------
 
 def stage4b_probe(full_embeddings, artist_groups, painting_ids, rows):
-    """PCA + Logistic Regression + LOO-CV + permutation test on autograph vs circle."""
+    """PCA + multi-classifier LOO-CV + permutation test on autograph vs circle."""
     from sklearn.decomposition import PCA
     from sklearn.linear_model import LogisticRegression
+    from sklearn.svm import SVC
+    from sklearn.neural_network import MLPClassifier
 
     # Filter to autograph + circle only
     mask = np.array([(g in ("rembrandt_autograph", "rembrandt_circle")) for g in artist_groups])
@@ -1186,69 +1188,105 @@ def stage4b_probe(full_embeddings, artist_groups, painting_ids, rows):
     n = len(y)
     n_auto = int(y.sum())
     n_circle = n - n_auto
-    print(f"\n[Stage 4b] Linear probe: {n_auto} autograph + {n_circle} circle = {n} paintings")
+    print(f"\n[Stage 4b] Probe: {n_auto} autograph + {n_circle} circle = {n} paintings")
     print(f"  Features: {X.shape[1]}d → PCA reduction\n")
 
-    pca_dims = [d for d in [10, 20, 50] if d < n]
-    C_values = [0.001, 0.01, 0.1, 1.0, 10.0]
+    pca_dims = [d for d in [10, 20] if d < n]
 
-    def loo_accuracy(X_data, y_data, C):
-        """Leave-one-out CV accuracy for logistic regression."""
+    # Classifier configs: (name, make_clf, param_name, param_values)
+    classifiers = [
+        ("Logistic", lambda v: LogisticRegression(C=v, solver="lbfgs", max_iter=1000),
+         "C", [0.001, 0.01, 0.1, 1.0, 10.0]),
+        ("SVM RBF", lambda v: SVC(C=v, kernel="rbf", gamma="scale"),
+         "C", [0.001, 0.01, 0.1, 1.0, 10.0]),
+        ("MLP (32)", lambda v: MLPClassifier(hidden_layer_sizes=(32,), alpha=v, max_iter=1000, random_state=42),
+         "alpha", [0.01, 0.1, 1.0, 10.0]),
+    ]
+
+    def loo_accuracy(X_data, y_data, make_clf, param_val):
+        """Leave-one-out CV accuracy for a given classifier."""
         correct = 0
         for i in range(len(y_data)):
             X_train = np.delete(X_data, i, axis=0)
             y_train = np.delete(y_data, i)
             X_test = X_data[i:i+1]
-            clf = LogisticRegression(C=C, l1_ratio=0, solver="lbfgs", max_iter=1000)
+            clf = make_clf(param_val)
             clf.fit(X_train, y_train)
             if clf.predict(X_test)[0] == y_data[i]:
                 correct += 1
         return correct / len(y_data)
 
-    # Grid search
-    print(f"  {'PCA dims':<10} " + " ".join(f"C={c:<8}" for c in C_values))
-    print(f"  {'-'*10} " + " ".join(f"{'-'*10}" for _ in C_values))
-    best_acc, best_dims, best_C = 0, 0, 0
-    for dims in pca_dims:
-        pca = PCA(n_components=dims, random_state=42)
-        X_pca = pca.fit_transform(X)
-        row_str = f"  {dims:<10}"
-        for C in C_values:
-            acc = loo_accuracy(X_pca, y, C)
-            row_str += f" {acc:<10.3f}"
-            if acc > best_acc:
-                best_acc, best_dims, best_C = acc, dims, C
-        print(row_str)
+    # Grid search per classifier
+    all_results = []
+    overall_best_acc = 0
+    overall_best = None  # (name, dims, param_name, param_val, make_clf)
 
-    print(f"\n  Best: PCA={best_dims}, C={best_C} → LOO accuracy = {best_acc:.3f}")
+    for clf_name, make_clf, param_name, param_values in classifiers:
+        print(f"  --- {clf_name} ---")
+        print(f"  {'PCA dims':<10} " + " ".join(f"{param_name}={v:<7}" for v in param_values))
+        print(f"  {'-'*10} " + " ".join(f"{'-'*10}" for _ in param_values))
+        best_acc, best_dims, best_param = 0, 0, 0
+        for dims in pca_dims:
+            pca = PCA(n_components=dims, random_state=42)
+            X_pca = pca.fit_transform(X)
+            row_str = f"  {dims:<10}"
+            for v in param_values:
+                acc = loo_accuracy(X_pca, y, make_clf, v)
+                row_str += f" {acc:<10.3f}"
+                if acc > best_acc:
+                    best_acc, best_dims, best_param = acc, dims, v
+            print(row_str)
+        print(f"  Best: PCA={best_dims}, {param_name}={best_param} → {best_acc:.3f}\n")
+        all_results.append({
+            "classifier": clf_name,
+            "best_pca_dims": best_dims,
+            "best_param_name": param_name,
+            "best_param_value": best_param,
+            "loo_accuracy": round(best_acc, 4),
+        })
+        if best_acc > overall_best_acc:
+            overall_best_acc = best_acc
+            overall_best = (clf_name, best_dims, param_name, best_param, make_clf)
 
-    # Permutation test on best config
+    # Comparison table
+    print(f"  COMPARISON")
+    print(f"  {'Classifier':<14} {'Best PCA':<10} {'Best param':<14} {'LOO acc':<8}")
+    print(f"  {'-'*14} {'-'*10} {'-'*14} {'-'*8}")
+    for r in all_results:
+        param_str = f"{r['best_param_name']}={r['best_param_value']}"
+        print(f"  {r['classifier']:<14} {r['best_pca_dims']:<10} {param_str:<14} {r['loo_accuracy']:<8.3f}")
+
+    best_name, best_dims, best_pname, best_pval, best_make_clf = overall_best
+    print(f"\n  Overall best: {best_name} (PCA={best_dims}, {best_pname}={best_pval}) → {overall_best_acc:.3f}")
+
+    # Permutation test on overall best only
     n_perms = 1000
-    print(f"\n  Permutation test ({n_perms} shuffles)...")
+    print(f"\n  Permutation test on {best_name} ({n_perms} shuffles)...")
     pca = PCA(n_components=best_dims, random_state=42)
     X_best = pca.fit_transform(X)
     null_accs = np.zeros(n_perms)
     rng = np.random.RandomState(42)
     for p in range(n_perms):
         y_shuf = rng.permutation(y)
-        null_accs[p] = loo_accuracy(X_best, y_shuf, best_C)
+        null_accs[p] = loo_accuracy(X_best, y_shuf, best_make_clf, best_pval)
         if (p + 1) % 100 == 0:
             print(f"    {p+1}/{n_perms} done")
 
-    p_value = (np.sum(null_accs >= best_acc) + 1) / (n_perms + 1)
+    p_value = (np.sum(null_accs >= overall_best_acc) + 1) / (n_perms + 1)
     null_mean = null_accs.mean()
     null_std = null_accs.std()
 
     print(f"\n{'='*60}")
-    print(f"  LINEAR PROBE RESULTS (Option F)")
+    print(f"  PROBE RESULTS (Option H — Non-linear)")
     print(f"{'='*60}")
     print(f"  N autograph:          {n_auto}")
     print(f"  N circle:             {n_circle}")
+    print(f"  Best classifier:      {best_name}")
     print(f"  Best PCA dims:        {best_dims}")
-    print(f"  Best C:               {best_C}")
-    print(f"  LOO accuracy:         {best_acc:.3f}")
+    print(f"  Best {best_pname}:{'':>{13-len(best_pname)}}{best_pval}")
+    print(f"  LOO accuracy:         {overall_best_acc:.3f}")
     print(f"  Permutation p-value:  {p_value:.4f}")
-    print(f"  Null mean ± std:      {null_mean:.3f} ± {null_std:.3f}")
+    print(f"  Null mean +/- std:    {null_mean:.3f} +/- {null_std:.3f}")
     print(f"  Signal:               {'YES (p < 0.05)' if p_value < 0.05 else 'NO (p >= 0.05)'}")
     print(f"{'='*60}")
 
@@ -1256,13 +1294,16 @@ def stage4b_probe(full_embeddings, artist_groups, painting_ids, rows):
         "n_autograph": n_auto,
         "n_circle": n_circle,
         "n_total": n,
+        "classifier": best_name,
         "best_pca_dims": best_dims,
-        "best_C": best_C,
-        "loo_accuracy": round(best_acc, 4),
+        "best_param_name": best_pname,
+        "best_param_value": best_pval,
+        "loo_accuracy": round(overall_best_acc, 4),
         "permutation_p_value": round(p_value, 4),
         "null_mean": round(null_mean, 4),
         "null_std": round(null_std, 4),
         "n_permutations": n_perms,
+        "all_classifiers": all_results,
     }
     with open(RESULTS_PROBE_JSON, "w") as f:
         json.dump(results, f, indent=2)
@@ -1296,7 +1337,7 @@ def main():
 
     # --probe: load cached v1 embeddings, run linear probe, exit
     if probe:
-        print("[Mode] v1-F — linear probe (autograph vs circle)")
+        print("[Mode] v1-H — probe: Logistic + SVM RBF + MLP (autograph vs circle)")
         if not INVENTORY_CSV.exists():
             print("ERROR: No cached inventory. Run full pipeline first.")
             sys.exit(1)
