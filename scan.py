@@ -49,6 +49,7 @@ EMBEDDINGS_ENTROPY_NPZ = CACHE_EMB / "embeddings_entropy.npz"
 EMBEDDINGS_ENTROPY_VITL_NPZ = CACHE_EMB / "embeddings_entropy_vitl.npz"
 RESULTS_ENTROPY_JSON = CACHE_DIR / "results_entropy.json"
 RESULTS_ENTROPY_VITL_JSON = CACHE_DIR / "results_entropy_vitl.json"
+RESULTS_PROBE_JSON = CACHE_DIR / "results_probe.json"
 
 TILE_SIZE = 224
 IMG_MAX_PX = 2000        # v1 low-res cap
@@ -1169,6 +1170,106 @@ def stage5_comparison(metrics, hires=False, model_name="vitb14", entropy=False):
 
 
 # ---------------------------------------------------------------------------
+# Stage 4b: Linear Probe (Option F)
+# ---------------------------------------------------------------------------
+
+def stage4b_probe(full_embeddings, artist_groups, painting_ids, rows):
+    """PCA + Logistic Regression + LOO-CV + permutation test on autograph vs circle."""
+    from sklearn.decomposition import PCA
+    from sklearn.linear_model import LogisticRegression
+
+    # Filter to autograph + circle only
+    mask = np.array([(g in ("rembrandt_autograph", "rembrandt_circle")) for g in artist_groups])
+    X = full_embeddings[mask]
+    y = np.array([1 if g == "rembrandt_autograph" else 0 for g in artist_groups[mask]])
+    ids = painting_ids[mask]
+    n = len(y)
+    n_auto = int(y.sum())
+    n_circle = n - n_auto
+    print(f"\n[Stage 4b] Linear probe: {n_auto} autograph + {n_circle} circle = {n} paintings")
+    print(f"  Features: {X.shape[1]}d → PCA reduction\n")
+
+    pca_dims = [d for d in [10, 20, 50] if d < n]
+    C_values = [0.001, 0.01, 0.1, 1.0, 10.0]
+
+    def loo_accuracy(X_data, y_data, C):
+        """Leave-one-out CV accuracy for logistic regression."""
+        correct = 0
+        for i in range(len(y_data)):
+            X_train = np.delete(X_data, i, axis=0)
+            y_train = np.delete(y_data, i)
+            X_test = X_data[i:i+1]
+            clf = LogisticRegression(C=C, l1_ratio=0, solver="lbfgs", max_iter=1000)
+            clf.fit(X_train, y_train)
+            if clf.predict(X_test)[0] == y_data[i]:
+                correct += 1
+        return correct / len(y_data)
+
+    # Grid search
+    print(f"  {'PCA dims':<10} " + " ".join(f"C={c:<8}" for c in C_values))
+    print(f"  {'-'*10} " + " ".join(f"{'-'*10}" for _ in C_values))
+    best_acc, best_dims, best_C = 0, 0, 0
+    for dims in pca_dims:
+        pca = PCA(n_components=dims, random_state=42)
+        X_pca = pca.fit_transform(X)
+        row_str = f"  {dims:<10}"
+        for C in C_values:
+            acc = loo_accuracy(X_pca, y, C)
+            row_str += f" {acc:<10.3f}"
+            if acc > best_acc:
+                best_acc, best_dims, best_C = acc, dims, C
+        print(row_str)
+
+    print(f"\n  Best: PCA={best_dims}, C={best_C} → LOO accuracy = {best_acc:.3f}")
+
+    # Permutation test on best config
+    n_perms = 1000
+    print(f"\n  Permutation test ({n_perms} shuffles)...")
+    pca = PCA(n_components=best_dims, random_state=42)
+    X_best = pca.fit_transform(X)
+    null_accs = np.zeros(n_perms)
+    rng = np.random.RandomState(42)
+    for p in range(n_perms):
+        y_shuf = rng.permutation(y)
+        null_accs[p] = loo_accuracy(X_best, y_shuf, best_C)
+        if (p + 1) % 100 == 0:
+            print(f"    {p+1}/{n_perms} done")
+
+    p_value = (np.sum(null_accs >= best_acc) + 1) / (n_perms + 1)
+    null_mean = null_accs.mean()
+    null_std = null_accs.std()
+
+    print(f"\n{'='*60}")
+    print(f"  LINEAR PROBE RESULTS (Option F)")
+    print(f"{'='*60}")
+    print(f"  N autograph:          {n_auto}")
+    print(f"  N circle:             {n_circle}")
+    print(f"  Best PCA dims:        {best_dims}")
+    print(f"  Best C:               {best_C}")
+    print(f"  LOO accuracy:         {best_acc:.3f}")
+    print(f"  Permutation p-value:  {p_value:.4f}")
+    print(f"  Null mean ± std:      {null_mean:.3f} ± {null_std:.3f}")
+    print(f"  Signal:               {'YES (p < 0.05)' if p_value < 0.05 else 'NO (p >= 0.05)'}")
+    print(f"{'='*60}")
+
+    results = {
+        "n_autograph": n_auto,
+        "n_circle": n_circle,
+        "n_total": n,
+        "best_pca_dims": best_dims,
+        "best_C": best_C,
+        "loo_accuracy": round(best_acc, 4),
+        "permutation_p_value": round(p_value, 4),
+        "null_mean": round(null_mean, 4),
+        "null_std": round(null_std, 4),
+        "n_permutations": n_perms,
+    }
+    with open(RESULTS_PROBE_JSON, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"\n  Saved → {RESULTS_PROBE_JSON}")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1182,13 +1283,36 @@ def main():
                         help="DINOv2 backbone: vitb14 (768d, default) or vitl14 (1024d)")
     parser.add_argument("--entropy", action="store_true",
                         help="Option D: entropy-weighted tile aggregation")
+    parser.add_argument("--probe", action="store_true",
+                        help="Option F: linear probe on frozen embeddings (autograph vs circle)")
     args = parser.parse_args()
     hires = args.hires
     model_name = args.model
     entropy = args.entropy
+    probe = args.probe
 
     for d in [CACHE_META, CACHE_IMG, CACHE_IMG_HIRES, CACHE_EMB, CACHE_PLOTS]:
         d.mkdir(parents=True, exist_ok=True)
+
+    # --probe: load cached v1 embeddings, run linear probe, exit
+    if probe:
+        print("[Mode] v1-F — linear probe (autograph vs circle)")
+        if not INVENTORY_CSV.exists():
+            print("ERROR: No cached inventory. Run full pipeline first.")
+            sys.exit(1)
+        if not EMBEDDINGS_NPZ.exists():
+            print("ERROR: No cached v1 embeddings. Run full pipeline first.")
+            sys.exit(1)
+        with open(INVENTORY_CSV) as f:
+            rows = list(csv.DictReader(f))
+        data = np.load(EMBEDDINGS_NPZ, allow_pickle=True)
+        painting_ids = data["painting_ids"]
+        cls_emb = data["cls_embeddings"]
+        patch_emb = data["patch_embeddings"]
+        artist_groups = data["artist_groups"]
+        full_embeddings = np.concatenate([cls_emb, patch_emb], axis=1)
+        stage4b_probe(full_embeddings, artist_groups, painting_ids, rows)
+        return
 
     start_stage = args.stage or 1
     end_stage = args.stage or 5
