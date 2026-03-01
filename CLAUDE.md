@@ -17,11 +17,12 @@ AI-driven art authentication via DINOv2 embeddings. Collection-scale screening �
 | Run specific stage | `python scan.py --stage N` |
 | High-res mode (v2) | `python scan.py --hires` |
 | ViT-L/14 model | `python scan.py --model vitl14` |
+| Re-fetch all data | `python scan.py --refetch` |
 
 ## Environment
 
 - **Compute:** MPS (local), Google Colab Pro (T4 GPUs)
-- **Data:** Rijksmuseum APIs (free, no API key needed). Met Open Access. Other CC0 collections via IIIF.
+- **Data:** Rijksmuseum APIs, Met Open Access, Wikidata SPARQL, NGA/CMA/AIC APIs. All free, no API keys.
 - **Storage:** Three-tier cache: metadata → images → embeddings (~1.5 GB for prototype)
 - **Repo:** Private GitHub: `david-fitzgerald/authentication-scanner`
 
@@ -29,7 +30,7 @@ AI-driven art authentication via DINOv2 embeddings. Collection-scale screening �
 
 | File | What |
 |------|------|
-| `scan.py` | Local pipeline. Rijksmuseum + Met Open Access. Three-tier cache (metadata→images→embeddings). MPS device. |
+| `scan.py` | Local pipeline. Rijksmuseum + Met + Wikidata SPARQL + museum APIs. Three-tier cache (metadata→images→embeddings). MPS device. |
 | `prototype.ipynb` | Phase 1 prototype. DINOv2 embedding pipeline on Rijksmuseum Rembrandt corpus. Run on Colab Pro (T4). |
 | `scan-results.md` | Local pipeline results. v1 vs v2 comparison, key findings, next steps (C/D/E/F). |
 | `prototype-results.md` | Colab prototype results. Original Rijksmuseum-only metrics + API discoveries. |
@@ -39,7 +40,7 @@ AI-driven art authentication via DINOv2 embeddings. Collection-scale screening �
 
 ## Status
 
-**Features tapped out — more data needed.** Non-linear probes (SVM RBF 66.0%, MLP 72.3%) fail to beat logistic regression (72.3%, p=0.015). Frozen DINOv2 embeddings contain no untapped non-linear signal. Next: more data (option G).
+**Dataset expanded via Wikidata SPARQL (Option G).** 1311 paintings (was ~108). Circle: 149 (was 18), autograph: 562 (was 29). Next: download images + re-embed + re-run probe to see if accuracy beats 72.3%.
 
 ## Decisions Log
 
@@ -55,6 +56,7 @@ AI-driven art authentication via DINOv2 embeddings. Collection-scale screening �
 | 2026-03-01 | Entropy-weighted tiles (option D) eliminated | Circle p=0.615 (marginal). Pupil p collapsed. Aggregation not the bottleneck. Next: linear probe (F). |
 | 2026-03-01 | Linear probe (option F): signal confirmed | 72.3% LOO, perm p=0.015. Supervised signal exists in frozen DINOv2 features. Weak but real. |
 | 2026-03-01 | Non-linear probes (option H): features tapped out | SVM RBF 66.0%, MLP 72.3% — no gain over logistic. Bottleneck is data quantity, not classifier capacity. |
+| 2026-03-01 | Option G: Wikidata SPARQL dataset expansion | 1311 paintings (was ~108). Circle 149, autograph 562, pupil 327, dutch_other 273. Wikidata primary source. |
 
 ## Conventions
 
