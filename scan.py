@@ -1646,26 +1646,38 @@ def stage4b_probe(full_embeddings, artist_groups, painting_ids, rows):
 
     # Classifier configs: (name, make_clf, param_name, param_values)
     classifiers = [
-        ("Logistic", lambda v: LogisticRegression(C=v, solver="lbfgs", max_iter=1000),
+        ("Logistic", lambda v: LogisticRegression(C=v, solver="lbfgs", max_iter=1000, class_weight="balanced"),
          "C", [0.001, 0.01, 0.1, 1.0, 10.0]),
-        ("SVM RBF", lambda v: SVC(C=v, kernel="rbf", gamma="scale"),
+        ("SVM RBF", lambda v: SVC(C=v, kernel="rbf", gamma="scale", class_weight="balanced"),
          "C", [0.001, 0.01, 0.1, 1.0, 10.0]),
         ("MLP (32)", lambda v: MLPClassifier(hidden_layer_sizes=(32,), alpha=v, max_iter=1000, random_state=42),
          "alpha", [0.01, 0.1, 1.0, 10.0]),
     ]
 
-    def loo_accuracy(X_data, y_data, make_clf, param_val):
-        """Leave-one-out CV accuracy for a given classifier."""
-        correct = 0
-        for i in range(len(y_data)):
-            X_train = np.delete(X_data, i, axis=0)
-            y_train = np.delete(y_data, i)
-            X_test = X_data[i:i+1]
-            clf = make_clf(param_val)
-            clf.fit(X_train, y_train)
-            if clf.predict(X_test)[0] == y_data[i]:
-                correct += 1
-        return correct / len(y_data)
+    from sklearn.model_selection import StratifiedKFold, cross_val_score
+
+    # LOO is impractical at N>100 (O(N²) fits). Use stratified 10-fold instead.
+    use_loo = n <= 100
+    cv_label = "LOO" if use_loo else "10-fold"
+
+    def cv_accuracy(X_data, y_data, make_clf, param_val):
+        """Cross-validated accuracy: LOO if N<=100, else stratified 10-fold."""
+        clf = make_clf(param_val)
+        if use_loo:
+            correct = 0
+            for i in range(len(y_data)):
+                X_train = np.delete(X_data, i, axis=0)
+                y_train = np.delete(y_data, i)
+                X_test = X_data[i:i+1]
+                c = make_clf(param_val)
+                c.fit(X_train, y_train)
+                if c.predict(X_test)[0] == y_data[i]:
+                    correct += 1
+            return correct / len(y_data)
+        else:
+            skf = StratifiedKFold(n_splits=10, shuffle=True, random_state=42)
+            scores = cross_val_score(clf, X_data, y_data, cv=skf, scoring="balanced_accuracy")
+            return scores.mean()
 
     # Grid search per classifier
     all_results = []
@@ -1682,18 +1694,19 @@ def stage4b_probe(full_embeddings, artist_groups, painting_ids, rows):
             X_pca = pca.fit_transform(X)
             row_str = f"  {dims:<10}"
             for v in param_values:
-                acc = loo_accuracy(X_pca, y, make_clf, v)
+                acc = cv_accuracy(X_pca, y, make_clf, v)
                 row_str += f" {acc:<10.3f}"
                 if acc > best_acc:
                     best_acc, best_dims, best_param = acc, dims, v
             print(row_str)
-        print(f"  Best: PCA={best_dims}, {param_name}={best_param} → {best_acc:.3f}\n")
+        print(f"  Best: PCA={best_dims}, {param_name}={best_param} → {best_acc:.3f} ({cv_label})\n")
         all_results.append({
             "classifier": clf_name,
             "best_pca_dims": best_dims,
             "best_param_name": param_name,
             "best_param_value": best_param,
-            "loo_accuracy": round(best_acc, 4),
+            "cv_accuracy": round(best_acc, 4),
+            "cv_method": cv_label,
         })
         if best_acc > overall_best_acc:
             overall_best_acc = best_acc
@@ -1701,11 +1714,11 @@ def stage4b_probe(full_embeddings, artist_groups, painting_ids, rows):
 
     # Comparison table
     print(f"  COMPARISON")
-    print(f"  {'Classifier':<14} {'Best PCA':<10} {'Best param':<14} {'LOO acc':<8}")
-    print(f"  {'-'*14} {'-'*10} {'-'*14} {'-'*8}")
+    print(f"  {'Classifier':<14} {'Best PCA':<10} {'Best param':<14} {cv_label + ' acc':<10}")
+    print(f"  {'-'*14} {'-'*10} {'-'*14} {'-'*10}")
     for r in all_results:
         param_str = f"{r['best_param_name']}={r['best_param_value']}"
-        print(f"  {r['classifier']:<14} {r['best_pca_dims']:<10} {param_str:<14} {r['loo_accuracy']:<8.3f}")
+        print(f"  {r['classifier']:<14} {r['best_pca_dims']:<10} {param_str:<14} {r['cv_accuracy']:<10.3f}")
 
     best_name, best_dims, best_pname, best_pval, best_make_clf = overall_best
     print(f"\n  Overall best: {best_name} (PCA={best_dims}, {best_pname}={best_pval}) → {overall_best_acc:.3f}")
@@ -1719,7 +1732,7 @@ def stage4b_probe(full_embeddings, artist_groups, painting_ids, rows):
     rng = np.random.RandomState(42)
     for p in range(n_perms):
         y_shuf = rng.permutation(y)
-        null_accs[p] = loo_accuracy(X_best, y_shuf, best_make_clf, best_pval)
+        null_accs[p] = cv_accuracy(X_best, y_shuf, best_make_clf, best_pval)
         if (p + 1) % 100 == 0:
             print(f"    {p+1}/{n_perms} done")
 
@@ -1728,14 +1741,14 @@ def stage4b_probe(full_embeddings, artist_groups, painting_ids, rows):
     null_std = null_accs.std()
 
     print(f"\n{'='*60}")
-    print(f"  PROBE RESULTS (Option H — Non-linear)")
+    print(f"  PROBE RESULTS (balanced, {cv_label})")
     print(f"{'='*60}")
     print(f"  N autograph:          {n_auto}")
     print(f"  N circle:             {n_circle}")
     print(f"  Best classifier:      {best_name}")
     print(f"  Best PCA dims:        {best_dims}")
     print(f"  Best {best_pname}:{'':>{13-len(best_pname)}}{best_pval}")
-    print(f"  LOO accuracy:         {overall_best_acc:.3f}")
+    print(f"  {cv_label} accuracy:       {overall_best_acc:.3f}")
     print(f"  Permutation p-value:  {p_value:.4f}")
     print(f"  Null mean +/- std:    {null_mean:.3f} +/- {null_std:.3f}")
     print(f"  Signal:               {'YES (p < 0.05)' if p_value < 0.05 else 'NO (p >= 0.05)'}")
@@ -1749,7 +1762,8 @@ def stage4b_probe(full_embeddings, artist_groups, painting_ids, rows):
         "best_pca_dims": best_dims,
         "best_param_name": best_pname,
         "best_param_value": best_pval,
-        "loo_accuracy": round(overall_best_acc, 4),
+        "cv_accuracy": round(overall_best_acc, 4),
+        "cv_method": cv_label,
         "permutation_p_value": round(p_value, 4),
         "null_mean": round(null_mean, 4),
         "null_std": round(null_std, 4),

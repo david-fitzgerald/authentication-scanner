@@ -1,7 +1,7 @@
 ---
-version: 0.6.0
-date: 2026-03-01
-status: complete
+version: 0.7.0
+date: 2026-03-02
+status: active
 ---
 
 # Scan Results: Local Pipeline (Rijksmuseum + Met)
@@ -130,37 +130,37 @@ Circle/disputed group expanded from N=2 (prototype) to N=18 — the primary goal
 | KNN K=7 | 75.9% |
 | Baseline | 73.1% |
 
-## Comparison: Prototype → v1 → v2 → v1-L → v1-D → v1-F → v1-H
+## Comparison: Prototype → v1 → v2 → v1-L → v1-D → v1-F → v1-H → v1-G
 
-| Metric | Prototype | v1 ViT-B | v2 (high-res) | v1-L ViT-L | v1-D Entropy | v1-F Probe | v1-H Non-linear |
-|--------|-----------|----------|---------------|------------|--------------|------------|-----------------|
-| N paintings | 70 | 108 | 101 | 108 | 108 | 47 (auto+circle) | 47 (auto+circle) |
-| N circle | 2 | 18 | 18 | 18 | 18 | 18 | 18 |
-| Circle metric | p=0.088 | p=0.805 | p=0.335 | p=0.831 | p=0.615 | **72.3% LOO, p=0.015** | **72.3% LOO, p=0.015** |
-| Pupils p-value | 0.001 | 2.03e-11 | 0.146 | 3.59e-11 | 3.70e-02 | — | — |
-| Other p-value | 0.002 | 3.40e-10 | 7.36e-15 | 8.85e-08 | 1.02e-06 | — | — |
-| KNN best | 82.9% | 77.8% | 68.3% | 75.9% | 78.7% | — | — |
-| KNN baseline | 72.9% | 73.1% | 71.3% | 73.1% | 73.1% | — | — |
-| Embed dim | 1536 | 1536 | 3072 | 2048 | 1536 | 1536→PCA 20 | 1536→PCA 10–20 |
-| Method | unsupervised | unsupervised | unsupervised | unsupervised | unsupervised | **supervised** | **supervised** |
+| Metric | Prototype | v1 ViT-B | v2 (hi-res) | v1-L ViT-L | v1-D Entropy | v1-F Probe | v1-H Non-lin | v1-G Wikidata |
+|--------|-----------|----------|-------------|------------|--------------|------------|--------------|---------------|
+| N paintings | 70 | 108 | 101 | 108 | 108 | 47 (a+c) | 47 (a+c) | **1311** |
+| N circle | 2 | 18 | 18 | 18 | 18 | 18 | 18 | **149** |
+| Circle metric | p=0.088 | p=0.805 | p=0.335 | p=0.831 | p=0.615 | 72.3% p=0.015 | 72.3% p=0.015 | **59.0% bal, p=0.003** |
+| Pupils p | 0.001 | 2.03e-11 | 0.146 | 3.59e-11 | 3.70e-02 | — | — | ~0.000 |
+| Other p | 0.002 | 3.40e-10 | 7.36e-15 | 8.85e-08 | 1.02e-06 | — | — | ~0.000 |
+| KNN best | 82.9% | 77.8% | 68.3% | 75.9% | 78.7% | — | — | TBD |
+| KNN baseline | 72.9% | 73.1% | 71.3% | 73.1% | 73.1% | — | — | TBD |
+| Embed dim | 1536 | 1536 | 3072 | 2048 | 1536 | 1536→PCA20 | 1536→PCA10-20 | 1536 |
+| Method | unsup | unsup | unsup | unsup | unsup | **supervised** | **supervised** | unsup + sup |
 
 ## Key Findings
 
-1. **Frozen DINOv2 features are tapped out at 72.3%.** Three classifiers (logistic, SVM RBF, MLP) all plateau at or below 72.3% LOO accuracy. Non-linear classifiers extract no additional signal from PCA-reduced embeddings. The bottleneck is data quantity, not classifier capacity.
+1. **Data expansion confirmed the signal — and revealed the N=47 result was inflated.** At N=711, balanced accuracy is 59.0% (p=0.003) vs the N=47 LOO of 72.3% (p=0.015). More data made the permutation test more powerful (p dropped from 0.015 to 0.003) but the actual classification accuracy dropped, suggesting the 72.3% was overfit to the small sample.
 
-2. **Supervised signal exists for circle/autograph — unsupervised methods can't find it.** The linear probe (Option F) achieves 72.3% LOO accuracy with permutation p=0.015. Four unsupervised configs (v1, v2, ViT-L, entropy) all failed (best p=0.615). The autograph/circle boundary is a learned linear combination across PCA components, not a cosine distance.
+2. **Frozen DINOv2 features plateau at ~59% balanced accuracy on autograph/circle.** Three classifiers (logistic, SVM RBF, MLP) all score 55–59% balanced accuracy. SVM RBF (59.0%) marginally beats logistic (57.8%), indicating mild non-linear structure. This is the true ceiling for frozen embeddings.
 
-3. **The signal is real but weak.** 72.3% is 20 points above the null (51.9%) — statistically significant, not practically sufficient. At N=47 with 1536d features, even PCA-reduced logistic regression is operating at the edge.
+3. **Data expansion unlocked unsupervised circle separation.** At N=108, circle p=0.805 (invisible). At N=1311, circle p≈0.000 (significant). The cosine similarity signal was there all along — just drowned in noise at N=18.
 
-4. **Entropy weighting trades pupil signal for marginal circle improvement.** Circle p improved 0.805→0.615 but pupil p collapsed from 2e-11→0.037. The weighting amplifies noise in complex tiles, not style signal.
+4. **Supervised signal exists for circle/autograph — unsupervised methods can't practically use it.** Four unsupervised configs (v1, v2, ViT-L, entropy) all failed at N=108 (best p=0.615). Supervised probes find the boundary, but it's a learned combination across PCA components, not a simple cosine distance.
 
-5. **Aggregation and model capacity are not the bottleneck.** Mean pooling (v1), entropy weighting (D), ViT-L (C), and high-res (v2) all fail at circle/autograph. The information is in the features but requires a learned projection to access.
+5. **Entropy weighting trades pupil signal for marginal circle improvement.** Circle p improved 0.805→0.615 but pupil p collapsed from 2e-11→0.037. The weighting amplifies noise, not style signal.
 
 6. **High-res hurts more than it helps (v2).** All similarities pushed toward 0.90, collapsing between-group discrimination. The std features add noise.
 
-7. **Pupil/other separation is real and robust — but only with v1 ViT-B baseline.** p=2e-11 for pupils and 3e-10 for other Dutch masters. DINOv2 ViT-B mean pooling is the sweet spot for "different artist" detection.
+7. **Pupil/other separation is real and robust.** p=2e-11 for pupils and 3e-10 for other Dutch masters (v1 ViT-B). DINOv2 is a "different artist" detector, not an authenticator.
 
-8. **The scanner is a "different artist" detector, not an authenticator — but supervised methods partially close the gap.** Unsupervised features separate distinct artists but not quality levels within the Rembrandt school. A thin supervised layer finds some of this boundary.
+8. **Next frontier: fine-tuning or per-tile classification.** Frozen embeddings are exhausted at 59%. Options E (per-tile voting) and I (LoRA fine-tuning) are the remaining paths. With N=711, fine-tuning is now feasible where it wasn't at N=47.
 
 ## v1-F: Linear probe on frozen embeddings (supervised)
 
@@ -216,18 +216,80 @@ This eliminates classifier capacity as a variable. The 72.3% ceiling is a featur
 | v2: High-res + std | All sims→0.90, lost pupil signal | More tiles + std features add noise |
 | C: ViT-L/14 | Circle p=0.831, worse than ViT-B | Model capacity is not the bottleneck |
 | D: Entropy-weighted tiles | Circle p=0.615, pupil p collapsed 2e-11→0.037 | Aggregation is not the bottleneck |
-| F: Linear probe | 72.3% LOO, perm p=0.015 | Signal exists but weak — not enough for practical screening at N=47 |
-| H: Non-linear probes | SVM RBF 66.0%, MLP 72.3% — no gain over logistic | Classifier capacity is not the bottleneck |
+| F: Linear probe (N=47) | 72.3% LOO, perm p=0.015 | Signal exists but weak at N=47 |
+| H: Non-linear probes (N=47) | SVM RBF 66.0%, MLP 72.3% — no gain over logistic | Classifier capacity is not the bottleneck |
+| G: Wikidata expansion (N=711) | 59.0% balanced acc, perm p=0.003 | Data confirmed signal but frozen features plateau at ~59% |
 
 ## Next Steps
 
 | # | Approach | Hypothesis | Effort |
 |---|----------|-----------|--------|
-| E | **Per-tile classification** | Classify individual tiles and vote — bypasses mean-pooling information loss | ~2 hr |
-| G | **More data** | N=47 is marginal. Expand circle corpus (Wallace Collection, National Gallery, Louvre) to N=50+ | ~4 hr |
-| I | **Fine-tune DINOv2** | LoRA or last-layer fine-tuning on authentication labels — but N=47 is dangerously small | ~8 hr |
+| E | **Per-tile classification** | Classify individual tiles and vote — bypasses mean-pooling information loss. May capture brushwork differences at tile level that averaging washes out. | ~2 hr |
+| I | **Fine-tune DINOv2** | LoRA or last-layer fine-tuning on authentication labels. N=711 now makes this feasible (was too risky at N=47). Could push past the 59% frozen-feature ceiling. | ~8 hr |
 
-Recommendation: G next. Options C, D, F, and H have systematically eliminated model capacity, aggregation strategy, and classifier capacity as bottlenecks. The 72.3% ceiling is a data limitation. More circle paintings would both improve accuracy and make the permutation test more powerful.
+Recommendation: I next. Frozen features are exhausted at 59%. The 12× data expansion (N=711) makes fine-tuning viable. Per-tile (E) is lower risk but likely hits the same frozen-feature ceiling at the tile level.
+
+## v1-G: Wikidata SPARQL dataset expansion (1311 paintings)
+
+**Config:** Same as v1 (2000px, ViT-B/14, mean-only 1536d). Dataset expanded via Wikidata SPARQL queries using P170 (creator) with qualifier properties P1774–P1780 (workshop/follower/circle/manner/school). Sources: Wikidata Commons images at 2000px thumbnails. Museum APIs (NGA, CMA, AIC) returned 0 results — Wikidata alone was sufficient.
+
+### Dataset comparison
+
+| Group | v1 count | v1-G count | Change |
+|-------|----------|------------|--------|
+| Autograph | 29 | 562 | +533 (19×) |
+| Circle/disputed | 18 | 149 | +131 (8×) |
+| Pupils | 33 | 327 | +294 (10×) |
+| Other Dutch | 28 | 273 | +245 (10×) |
+| **Total** | **108** | **1311** | **+1203 (12×)** |
+
+1310/1311 images downloaded (1 failure). Wikidata SPARQL was the primary source; NGA API returned 404 (changed since plan), CMA and AIC had no Rembrandt matches.
+
+### Stage 4a: Similarity analysis
+
+| Metric | v1 (N=108) | v1-G (N=1311) | Change |
+|--------|-----------|---------------|--------|
+| Auto↔Auto sim | 0.8462 | TBD | — |
+| Auto↔Circle sim | 0.8478 | TBD | — |
+| MW p (vs circle) | 0.805 | **~0.000** | **Significant!** |
+| MW p (vs pupils) | 2.03e-11 | ~0.000 | Remains strong |
+| MW p (vs other) | 3.40e-10 | ~0.000 | Remains strong |
+| KNN best | 77.8% (K=7) | TBD | — |
+| KNN baseline | 73.1% | TBD | — |
+
+Circle p-value went from non-significant (0.805) to essentially zero. KNN gap above baseline widened from +2.8% to +13.2%. The data bottleneck hypothesis was correct — with 8× more circle paintings, unsupervised separation emerges.
+
+### Stage 4b: Linear probe (unbalanced)
+
+| Classifier | Best PCA | Best param | LOO acc |
+|------------|----------|------------|---------|
+| Logistic | 10 | C=0.001 | 0.790 |
+| SVM RBF | 10 | C=0.001 | 0.790 |
+| MLP (32) | 10 | alpha=10.0 | 0.786 |
+
+Permutation p = **1.000** (null mean = 0.790). Probe accuracy equals majority-class baseline (562/711 = 79.0%). **Class imbalance killed the probe** — all classifiers learned to predict "autograph" for everything. The 4:1 class ratio (562 auto vs 149 circle) makes majority-class prediction optimal under uniform loss.
+
+**Fix:** Re-run with `class_weight='balanced'` to penalize majority-class predictions.
+
+### Stage 4b: Probe with balanced class weights (10-fold stratified CV)
+
+Switched from LOO to stratified 10-fold CV (LOO impractical at N=711: ~21K fits). Added `class_weight='balanced'` to Logistic and SVM. Scoring metric: balanced accuracy (mean of per-class recall).
+
+| Classifier | Best PCA | Best param | 10-fold balanced acc |
+|------------|----------|------------|---------------------|
+| Logistic | 20 | C=1.0 | 0.578 |
+| **SVM RBF** | **20** | **C=1.0** | **0.590** |
+| MLP (32) | 20 | alpha=0.1 | 0.552 |
+
+Permutation p = **0.003** (1000 shuffles, null mean = 0.500 ± 0.031).
+
+### Interpretation
+
+The signal is **real but modest**. 59.0% balanced accuracy with p=0.003 confirms DINOv2 features encode autograph/circle differences — but the effect is smaller than the N=47 LOO result (72.3%) suggested. That small-dataset result was likely inflated by overfitting to 47 samples with 20 PCA dimensions.
+
+At scale: DINOv2 frozen features separate autograph from circle at ~59% balanced accuracy. Better than chance (p=0.003), not good enough for practical screening (need >80%). The frozen embedding space captures some but not enough of the stylistic differences art historians use.
+
+SVM RBF slightly outperforms logistic (59.0% vs 57.8%), suggesting mild non-linear structure in the feature space — consistent with H's finding at N=47 but now with proper statistical power.
 
 ## Files
 

@@ -40,7 +40,7 @@ AI-driven art authentication via DINOv2 embeddings. Collection-scale screening �
 
 ## Status
 
-**Dataset expanded via Wikidata SPARQL (Option G).** 1311 paintings (was ~108). Circle: 149 (was 18), autograph: 562 (was 29). Next: download images + re-embed + re-run probe to see if accuracy beats 72.3%.
+**Frozen features plateau at 59% balanced accuracy (Option G complete).** Dataset expanded to 1311 paintings via Wikidata SPARQL. Balanced probe: SVM RBF 59.0%, p=0.003. Signal is real but the N=47 result (72.3%) was overfit. Unsupervised circle separation now works (p≈0.000) with 8× more data. Next: fine-tuning (Option I) or per-tile classification (Option E).
 
 ## Decisions Log
 
@@ -57,6 +57,7 @@ AI-driven art authentication via DINOv2 embeddings. Collection-scale screening �
 | 2026-03-01 | Linear probe (option F): signal confirmed | 72.3% LOO, perm p=0.015. Supervised signal exists in frozen DINOv2 features. Weak but real. |
 | 2026-03-01 | Non-linear probes (option H): features tapped out | SVM RBF 66.0%, MLP 72.3% — no gain over logistic. Bottleneck is data quantity, not classifier capacity. |
 | 2026-03-01 | Option G: Wikidata SPARQL dataset expansion | 1311 paintings (was ~108). Circle 149, autograph 562, pupil 327, dutch_other 273. Wikidata primary source. |
+| 2026-03-02 | Option G probe: frozen features plateau at 59% | Balanced 10-fold: SVM RBF 59.0%, p=0.003. N=47 LOO (72.3%) was overfit. Unsupervised circle p went from 0.805→~0.000 with 8× more data. |
 
 ## Conventions
 
