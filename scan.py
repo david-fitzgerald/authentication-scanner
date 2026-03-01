@@ -45,6 +45,10 @@ EMBEDDINGS_VITL_NPZ = CACHE_EMB / "embeddings_vitl.npz"
 RESULTS_JSON = CACHE_DIR / "results.json"
 RESULTS_V2_JSON = CACHE_DIR / "results_v2.json"
 RESULTS_VITL_JSON = CACHE_DIR / "results_vitl.json"
+EMBEDDINGS_ENTROPY_NPZ = CACHE_EMB / "embeddings_entropy.npz"
+EMBEDDINGS_ENTROPY_VITL_NPZ = CACHE_EMB / "embeddings_entropy_vitl.npz"
+RESULTS_ENTROPY_JSON = CACHE_DIR / "results_entropy.json"
+RESULTS_ENTROPY_VITL_JSON = CACHE_DIR / "results_entropy_vitl.json"
 
 TILE_SIZE = 224
 IMG_MAX_PX = 2000        # v1 low-res cap
@@ -639,15 +643,18 @@ def _tile_batches(img, tile_size, batch_size, transform):
         yield torch.stack(batch)
 
 
-def stage3_embed(rows, hires=False, model_name="vitb14"):
+def stage3_embed(rows, hires=False, model_name="vitb14", entropy=False):
     """Tile images and embed with DINOv2.
 
     v1 (hires=False): mean-only aggregation. Cache: embeddings.npz
     v2 (hires=True):  mean+std aggregation. Cache: embeddings_v2.npz
     vitl14:           ViT-L model (1024d vs 768d). Cache: embeddings_vitl.npz
+    entropy:          entropy-weighted tile aggregation. Cache: embeddings_entropy[_vitl].npz
     """
     CACHE_EMB.mkdir(parents=True, exist_ok=True)
-    if model_name == "vitl14":
+    if entropy:
+        cache_file = EMBEDDINGS_ENTROPY_VITL_NPZ if model_name == "vitl14" else EMBEDDINGS_ENTROPY_NPZ
+    elif model_name == "vitl14":
         cache_file = EMBEDDINGS_VITL_NPZ
     elif hires:
         cache_file = EMBEDDINGS_V2_NPZ
@@ -728,19 +735,45 @@ def stage3_embed(rows, hires=False, model_name="vitb14"):
             # Stream tiles through model — never hold all in memory
             all_cls = []
             all_patch = []
+            all_tile_var = []
             for batch_tensor in _tile_batches(img, TILE_SIZE, batch_size, dino_transform):
                 batch_tensor = batch_tensor.to(device)
                 with torch.no_grad():
                     out = model.forward_features(batch_tensor)
                     all_cls.append(out["x_norm_clstoken"].cpu().numpy())
-                    all_patch.append(out["x_norm_patchtokens"].mean(dim=1).cpu().numpy())
+                    patch_tokens = out["x_norm_patchtokens"]
+                    all_patch.append(patch_tokens.mean(dim=1).cpu().numpy())
+                    if entropy:
+                        # Patch token variance = visual complexity proxy
+                        tile_var = patch_tokens.var(dim=1).mean(dim=1)  # (batch,)
+                        all_tile_var.append(tile_var.cpu().numpy())
 
             all_cls = np.concatenate(all_cls, axis=0)    # (N_tiles, embed_dim)
             all_patch = np.concatenate(all_patch, axis=0)  # (N_tiles, embed_dim)
 
             painting_ids.append(row["obj_id"])
-            cls_mean_list.append(all_cls.mean(axis=0))
-            patch_mean_list.append(all_patch.mean(axis=0))
+
+            if entropy:
+                tile_vars = np.concatenate(all_tile_var)
+                var_std = tile_vars.std()
+                if var_std > 1e-6:
+                    z = (tile_vars - tile_vars.mean()) / var_std
+                    weights = np.exp(z)
+                    weights /= weights.sum()
+                else:
+                    weights = np.ones(len(tile_vars)) / len(tile_vars)
+                cls_mean_list.append((all_cls * weights[:, None]).sum(axis=0))
+                patch_mean_list.append((all_patch * weights[:, None]).sum(axis=0))
+                # Diagnostic for first 3 paintings
+                if len(painting_ids) <= 3:
+                    uniform = 1.0 / len(tile_vars)
+                    print(f"      {row['obj_id']}: {len(tile_vars)} tiles, "
+                          f"var range [{tile_vars.min():.4f}, {tile_vars.max():.4f}], "
+                          f"weight range [{weights.min():.4f}, {weights.max():.4f}], "
+                          f"max/uniform {weights.max()/uniform:.1f}x")
+            else:
+                cls_mean_list.append(all_cls.mean(axis=0))
+                patch_mean_list.append(all_patch.mean(axis=0))
 
             if hires:
                 # Distribution features: std captures style consistency
@@ -794,7 +827,7 @@ def stage3_embed(rows, hires=False, model_name="vitb14"):
 def stage4_analysis(painting_ids, artist_groups, attributions, rows,
                     cls_mean=None, cls_std=None, patch_mean=None, patch_std=None,
                     cls_embeddings=None, patch_embeddings=None, hires=False,
-                    model_name="vitb14"):
+                    model_name="vitb14", entropy=False):
     """Run five analyses. Save plots and metrics."""
     import matplotlib
     matplotlib.use("Agg")
@@ -814,7 +847,9 @@ def stage4_analysis(painting_ids, artist_groups, attributions, rows,
         full_embeddings = np.concatenate([cm, pm], axis=1)
 
     n = len(painting_ids)
-    if model_name == "vitl14":
+    if entropy:
+        results_file = RESULTS_ENTROPY_VITL_JSON if model_name == "vitl14" else RESULTS_ENTROPY_JSON
+    elif model_name == "vitl14":
         results_file = RESULTS_VITL_JSON
     elif hires:
         results_file = RESULTS_V2_JSON
@@ -1051,10 +1086,16 @@ def stage4_analysis(painting_ids, artist_groups, attributions, rows,
 # Stage 5: Before/After Comparison
 # ---------------------------------------------------------------------------
 
-def stage5_comparison(metrics, hires=False, model_name="vitb14"):
+def stage5_comparison(metrics, hires=False, model_name="vitb14", entropy=False):
     """Print side-by-side comparison."""
-    # Compare against v1 combined results if hires/vitl, else against prototype
-    if model_name == "vitl14" and RESULTS_JSON.exists():
+    # Compare against v1 combined results if hires/vitl/entropy, else against prototype
+    if entropy and RESULTS_JSON.exists():
+        with open(RESULTS_JSON) as f:
+            old = json.load(f)
+        model_suffix = " ViT-L/14" if model_name == "vitl14" else " ViT-B/14"
+        old_label = f"v1{model_suffix} (mean)"
+        new_label = f"v1-D Entropy-weighted"
+    elif model_name == "vitl14" and RESULTS_JSON.exists():
         with open(RESULTS_JSON) as f:
             old = json.load(f)
         old_label = "v1 ViT-B/14"
@@ -1139,9 +1180,12 @@ def main():
                         help="v2: high-res images + distribution features (mean+std)")
     parser.add_argument("--model", choices=["vitb14", "vitl14"], default="vitb14",
                         help="DINOv2 backbone: vitb14 (768d, default) or vitl14 (1024d)")
+    parser.add_argument("--entropy", action="store_true",
+                        help="Option D: entropy-weighted tile aggregation")
     args = parser.parse_args()
     hires = args.hires
     model_name = args.model
+    entropy = args.entropy
 
     for d in [CACHE_META, CACHE_IMG, CACHE_IMG_HIRES, CACHE_EMB, CACHE_PLOTS]:
         d.mkdir(parents=True, exist_ok=True)
@@ -1150,7 +1194,9 @@ def main():
     end_stage = args.stage or 5
 
     model_label = "ViT-L/14" if model_name == "vitl14" else "ViT-B/14"
-    if hires:
+    if entropy:
+        print(f"[Mode] v1-D — entropy-weighted tile aggregation, {model_label}")
+    elif hires:
         print(f"[Mode] v2 — high-res images, mean+std features, {model_label}")
     else:
         print(f"[Mode] v1 — standard images, mean-only features, {model_label}")
@@ -1177,14 +1223,16 @@ def main():
         return
 
     # Stage 3
-    if model_name == "vitl14":
+    if entropy:
+        emb_file = EMBEDDINGS_ENTROPY_VITL_NPZ if model_name == "vitl14" else EMBEDDINGS_ENTROPY_NPZ
+    elif model_name == "vitl14":
         emb_file = EMBEDDINGS_VITL_NPZ
     elif hires:
         emb_file = EMBEDDINGS_V2_NPZ
     else:
         emb_file = EMBEDDINGS_NPZ
     if start_stage <= 3:
-        emb_result = stage3_embed(rows, hires=hires, model_name=model_name)
+        emb_result = stage3_embed(rows, hires=hires, model_name=model_name, entropy=entropy)
     else:
         if not emb_file.exists():
             print(f"ERROR: No cached embeddings at {emb_file}. Run stage 3 first.")
@@ -1212,10 +1260,13 @@ def main():
         analysis_kwargs = dict(cls_embeddings=cls_emb, patch_embeddings=patch_emb)
 
     analysis_kwargs["model_name"] = model_name
+    analysis_kwargs["entropy"] = entropy
     if start_stage <= 4:
         metrics = stage4_analysis(pids, groups, attribs, rows, **analysis_kwargs)
     else:
-        if model_name == "vitl14":
+        if entropy:
+            results_file = RESULTS_ENTROPY_VITL_JSON if model_name == "vitl14" else RESULTS_ENTROPY_JSON
+        elif model_name == "vitl14":
             results_file = RESULTS_VITL_JSON
         elif hires:
             results_file = RESULTS_V2_JSON
@@ -1231,7 +1282,7 @@ def main():
         return
 
     # Stage 5
-    stage5_comparison(metrics, hires=hires, model_name=model_name)
+    stage5_comparison(metrics, hires=hires, model_name=model_name, entropy=entropy)
 
 
 if __name__ == "__main__":
