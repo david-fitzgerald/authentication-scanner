@@ -59,7 +59,7 @@ BATCH_SIZE_VITB = 16     # conservative for 8 GB RAM
 BATCH_SIZE_VITL = 8      # ViT-L is ~1.2 GB vs ~350 MB
 CHUNK_SIZE = 5           # paintings per chunk (smaller for hires — more tiles per painting)
 EMBED_DIM = 768          # DINOv2 ViT-B/14=768, ViT-L/14=1024
-RATE_LIMIT = 0.3     # seconds between API calls
+RATE_LIMIT = 1.0     # seconds between API calls (Wikimedia requires ≥1s)
 
 # Rijksmuseum
 RK_SEARCH_URL = "https://data.rijksmuseum.nl/search/collection"
@@ -130,17 +130,20 @@ PROTOTYPE_METRICS = {
 # HTTP helpers
 # ---------------------------------------------------------------------------
 
-def fetch_with_retry(url, params=None, max_retries=3, backoff=0.3):
+def fetch_with_retry(url, params=None, max_retries=5, backoff=0.5):
     """GET with exponential backoff. Returns response or None."""
     for attempt in range(max_retries):
         try:
             delay = backoff * (2 ** attempt) if attempt > 0 else RATE_LIMIT
             time.sleep(delay)
-            resp = requests.get(url, params=params, timeout=30)
+            resp = requests.get(url, params=params, timeout=30,
+                                headers={"User-Agent": WD_UA})
             if resp.status_code == 200:
                 return resp
             if resp.status_code == 429:
-                print(f"  Rate limited, backing off...")
+                wait = min(30, 2 * (2 ** attempt))
+                print(f"  Rate limited, waiting {wait}s...")
+                time.sleep(wait)
                 continue
             print(f"  HTTP {resp.status_code} for {url}")
             return None
@@ -368,16 +371,26 @@ def wd_sparql(query):
 
 
 def wd_image_url(commons_url, width=2000):
-    """Convert Wikimedia Commons file URL to a sized thumbnail URL.
+    """Convert Wikimedia Commons file URL to an upload.wikimedia.org thumbnail URL.
 
     Input:  http://commons.wikimedia.org/wiki/Special:FilePath/Foo.jpg
-    Output: https://upload.wikimedia.org/wikipedia/commons/thumb/hash/Foo.jpg/{width}px-Foo.jpg
+    Output: https://upload.wikimedia.org/wikipedia/commons/thumb/a/ab/Foo.jpg/2000px-Foo.jpg
     """
-    # Commons P18 URLs are Special:FilePath redirects — just append ?width=
-    if "Special:FilePath" in commons_url:
-        return f"{commons_url}?width={width}"
-    # Direct upload URL — add /thumb/ variant
-    return f"{commons_url}?width={width}"
+    import hashlib
+    import urllib.parse
+    if "Special:FilePath/" in commons_url:
+        filename = commons_url.split("Special:FilePath/")[-1]
+    else:
+        filename = commons_url.rsplit("/", 1)[-1]
+    filename = urllib.parse.unquote(filename).replace(" ", "_")
+    md5 = hashlib.md5(filename.encode()).hexdigest()
+    encoded = urllib.parse.quote(filename)
+    thumb_name = f"{width}px-{encoded}"
+    # Non-JPEG formats: Commons generates .jpg thumbnails
+    ext = filename.rsplit(".", 1)[-1].lower()
+    if ext in ("tiff", "tif", "png", "svg"):
+        thumb_name += ".jpg"
+    return f"https://upload.wikimedia.org/wikipedia/commons/thumb/{md5[0]}/{md5[:2]}/{encoded}/{thumb_name}"
 
 
 def wd_fetch_circle_paintings():
