@@ -59,7 +59,7 @@ BATCH_SIZE_VITB = 16     # conservative for 8 GB RAM
 BATCH_SIZE_VITL = 8      # ViT-L is ~1.2 GB vs ~350 MB
 CHUNK_SIZE = 5           # paintings per chunk (smaller for hires — more tiles per painting)
 EMBED_DIM = 768          # DINOv2 ViT-B/14=768, ViT-L/14=1024
-RATE_LIMIT = 1.0     # seconds between API calls (Wikimedia requires ≥1s)
+RATE_LIMIT = 5.0     # seconds between image downloads (Wikimedia rate limit)
 
 # Rijksmuseum
 RK_SEARCH_URL = "https://data.rijksmuseum.nl/search/collection"
@@ -141,7 +141,7 @@ def fetch_with_retry(url, params=None, max_retries=5, backoff=0.5):
             if resp.status_code == 200:
                 return resp
             if resp.status_code == 429:
-                wait = min(30, 2 * (2 ** attempt))
+                wait = int(resp.headers.get("Retry-After", 10)) + 1
                 print(f"  Rate limited, waiting {wait}s...")
                 time.sleep(wait)
                 continue
