@@ -1,5 +1,5 @@
 ---
-version: 0.3.0
+version: 0.4.0
 date: 2026-03-01
 status: complete
 ---
@@ -110,49 +110,71 @@ Circle/disputed group expanded from N=2 (prototype) to N=18 — the primary goal
 | KNN K=7 | 70.4% |
 | Baseline | 73.1% |
 
-## Comparison: Prototype → v1 → v2 → v1-L
+## v1-D: Entropy-weighted tile aggregation (1536d)
 
-| Metric | Prototype (RIJ only) | v1 ViT-B | v2 (high-res) | v1-L ViT-L |
-|--------|---------------------|----------|---------------|------------|
-| N paintings | 70 | 108 | 101 | 108 |
-| N circle | 2 | 18 | 18 | 18 |
-| Circle p-value | 0.088 (N=2) | 0.805 | 0.335 | **0.831** |
-| Pupils p-value | 0.001 | 2.03e-11 | 0.146 | 3.59e-11 |
-| Other p-value | 0.002 | 3.40e-10 | 7.36e-15 | 8.85e-08 |
-| KNN best | 82.9% | 77.8% | 68.3% | 75.9% |
-| KNN baseline | 72.9% | 73.1% | 71.3% | 73.1% |
-| Embed dim | 1536 | 1536 | 3072 | 2048 |
+**Config:** Same as v1 (2000px, ViT-B/14) but tiles weighted by DINOv2 patch token variance instead of uniform mean. Variance = visual complexity proxy — high for brushwork/faces/hands, low for flat sky/background. Weight function: z-score → softmax (self-calibrating, no temperature hyperparameter). Degenerate guard: uniform fallback if std < 1e-6.
+
+**Diagnostics (first 3 paintings):** Variance range ~1.0–2.3, max/uniform weight ratios 3.6–10.5×. Weighting is meaningfully non-uniform.
+
+| Metric | Value |
+|--------|-------|
+| Auto↔Auto sim | 0.7921 |
+| Auto↔Circle sim | 0.7945 |
+| Auto↔Pupil sim | 0.7857 |
+| Auto↔Other sim | 0.7681 |
+| MW p (vs circle) | **0.615** — no signal (improved from 0.805, still nowhere near significant) |
+| MW p (vs pupils) | **3.70×10⁻²** — weak (degraded from 2e-11) |
+| MW p (vs other) | **1.02×10⁻⁶** — strong (degraded from 3e-10) |
+| KNN K=3 | 75.0% |
+| KNN K=5 | 78.7% |
+| KNN K=7 | 75.9% |
+| Baseline | 73.1% |
+
+## Comparison: Prototype → v1 → v2 → v1-L → v1-D
+
+| Metric | Prototype (RIJ only) | v1 ViT-B | v2 (high-res) | v1-L ViT-L | v1-D Entropy |
+|--------|---------------------|----------|---------------|------------|--------------|
+| N paintings | 70 | 108 | 101 | 108 | 108 |
+| N circle | 2 | 18 | 18 | 18 | 18 |
+| Circle p-value | 0.088 (N=2) | 0.805 | 0.335 | 0.831 | **0.615** |
+| Pupils p-value | 0.001 | 2.03e-11 | 0.146 | 3.59e-11 | 3.70e-02 |
+| Other p-value | 0.002 | 3.40e-10 | 7.36e-15 | 8.85e-08 | 1.02e-06 |
+| KNN best | 82.9% | 77.8% | 68.3% | 75.9% | 78.7% |
+| KNN baseline | 72.9% | 73.1% | 71.3% | 73.1% | 73.1% |
+| Embed dim | 1536 | 1536 | 3072 | 2048 | 1536 |
 
 ## Key Findings
 
-1. **Circle/autograph separation does not exist in DINOv2 features — regardless of model size.** Tested ViT-B/14 (768d) and ViT-L/14 (1024d, 3.5× larger). Circle p-value went from 0.805 → 0.831 (worse). The problem is not model capacity.
+1. **Circle/autograph separation does not exist in DINOv2 features — regardless of model size or aggregation method.** Tested ViT-B/14, ViT-L/14 (3.5× larger), and entropy-weighted aggregation. Best circle p=0.615 (entropy). Four experiments, none below 0.3.
 
-2. **ViT-L shifts all similarities upward uniformly.** Every pairwise similarity increased by ~0.02–0.03. The bigger model sees Rembrandt-school paintings as more alike, not less. It captures shared style more strongly but doesn't resolve within-school differences.
+2. **Entropy weighting trades pupil signal for marginal circle improvement.** Circle p improved 0.805→0.615 but pupil p collapsed from 2e-11→0.037 (five orders of magnitude worse). The weighting amplifies noise in complex tiles, not style signal. All similarities dropped ~0.05 uniformly.
 
-3. **ViT-L weakens other-Dutch separation.** p went from 3.4e-10 → 8.9e-8 — still strong, but two orders of magnitude weaker. The extra capacity dilutes the between-artist signal while amplifying the within-school similarity.
+3. **Aggregation is not the bottleneck.** Mean pooling wasn't washing out discriminative signal — the signal for circle/autograph separation simply isn't in generic DINOv2 embeddings. Confirmed by entropy weighting making things worse overall despite being non-trivially different (max/uniform weight ratios up to 10.5×).
 
-4. **High-res hurts more than it helps (v2).** All similarities pushed toward 0.90, collapsing the between-group discrimination that existed at 2000px. The std features add noise. More tiles per painting capture shared Dutch Golden Age texture (canvas, craquelure, varnish) that drowns out artist-specific style.
+4. **High-res hurts more than it helps (v2).** All similarities pushed toward 0.90, collapsing between-group discrimination. The std features add noise.
 
-5. **Pupil/other separation is real and robust (v1 ViT-B).** p=2e-11 for pupils and 3e-10 for other Dutch masters. DINOv2 can reliably tell "different artist" but not "same artist, different quality level."
+5. **ViT-L shifts all similarities upward uniformly.** Bigger model sees Rembrandt-school paintings as more alike, not less. Doesn't resolve within-school differences.
 
-6. **The scanner is a "different artist" detector, not an authenticator.** Useful for catching misattributed pupils or other-artist works sold as Rembrandt. Not useful for the harder circle/autograph question without fundamentally different features.
+6. **Pupil/other separation is real and robust — but only with v1 ViT-B baseline.** p=2e-11 for pupils and 3e-10 for other Dutch masters. Every variation tested (v2, ViT-L, entropy) degrades this signal. DINOv2 ViT-B mean pooling is the sweet spot for "different artist" detection.
+
+7. **The scanner is a "different artist" detector, not an authenticator.** Four feature configurations all confirm this. The circle/autograph question requires supervised learning, not better unsupervised features.
 
 ## Eliminated Options
 
 | Option | Result | Conclusion |
 |--------|--------|------------|
-| C: ViT-L/14 | Circle p=0.831, worse than ViT-B | Model capacity is not the bottleneck |
 | v2: High-res + std | All sims→0.90, lost pupil signal | More tiles + std features add noise |
+| C: ViT-L/14 | Circle p=0.831, worse than ViT-B | Model capacity is not the bottleneck |
+| D: Entropy-weighted tiles | Circle p=0.615, pupil p collapsed 2e-11→0.037 | Aggregation is not the bottleneck |
 
 ## Next Steps
 
 | # | Approach | Hypothesis | Effort |
 |---|----------|-----------|--------|
-| D | **Entropy-weighted tiles** | Weight complex tiles (brushwork) higher, suppress flat areas (sky, background) | ~1 hr code + rerun |
+| F | **Linear probe** | Thin supervised layer on frozen DINOv2 embeddings learns circle/autograph boundary | ~2 hr |
 | E | **Per-tile classification** | Instead of mean pooling, classify individual tiles and vote | ~2 hr |
-| F | **Linear probe** | Thin supervised layer on top of frozen DINOv2 | ~2 hr |
 
-Recommendation: D next — the aggregation method (mean pooling) may be washing out discriminative tiles. If D doesn't help, move to F (supervised signal).
+Recommendation: F next — unsupervised features exhausted (v2, C, D all failed). Supervised signal is the next logical step.
 
 ## Files
 
@@ -161,7 +183,9 @@ Recommendation: D next — the aggregation method (mean pooling) may be washing 
 | `cache/embeddings/embeddings.npz` | v1 ViT-B embeddings (1536d, 108 paintings) |
 | `cache/embeddings/embeddings_v2.npz` | v2 ViT-B embeddings (3072d, 101 paintings) |
 | `cache/embeddings/embeddings_vitl.npz` | v1-L ViT-L embeddings (2048d, 108 paintings) |
+| `cache/embeddings/embeddings_entropy.npz` | v1-D entropy-weighted embeddings (1536d, 108 paintings) |
 | `cache/results.json` | v1 ViT-B metrics |
 | `cache/results_v2.json` | v2 metrics |
 | `cache/results_vitl.json` | v1-L ViT-L metrics |
+| `cache/results_entropy.json` | v1-D entropy-weighted metrics |
 | `cache/plots/` | UMAP, cosine, heatmap for latest run |

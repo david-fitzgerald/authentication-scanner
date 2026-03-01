@@ -6,7 +6,7 @@ AI-driven art authentication and lost manuscript discovery. Collection-scale scr
 
 ## Status
 
-**Local pipeline complete (v1 + v2 + ViT-L).** Circle/autograph inseparable across all configs. ViT-L/14 (option C) tested — circle p=0.831, worse than ViT-B (p=0.805). Model capacity is not the bottleneck. Next: entropy-weighted tiles (option D) to test whether mean pooling washes out discriminative signal.
+**Local pipeline complete (v1 + v2 + ViT-L + entropy).** Circle/autograph inseparable across all four configs. Options C (ViT-L) and D (entropy-weighted tiles) both eliminated. Unsupervised DINOv2 features exhausted. Next: linear probe (option F) — supervised learning on frozen embeddings.
 
 ## Thesis
 
@@ -113,3 +113,4 @@ Stylometry for authorship attribution. Zero competition. Grant-fundable. Builds 
 | 2026-02-26 | High-res + std features (v2) hurt | All sims→0.90, lost pupil signal. Low-res mean-only (v1) is better. Revert to v1 as baseline. |
 | 2026-02-26 | Next: ViT-L/14 (C) then entropy-weighted tiles (D) | Systematic options before concluding ViT-B is ceiling. |
 | 2026-03-01 | ViT-L/14 (option C) eliminated | Circle p=0.831 (worse). All sims shifted up uniformly. Model capacity not the bottleneck. |
+| 2026-03-01 | Entropy-weighted tiles (option D) eliminated | Circle p=0.615 (marginal improvement), but pupil p collapsed 2e-11→0.037. Aggregation not the bottleneck. Next: linear probe (F). |
