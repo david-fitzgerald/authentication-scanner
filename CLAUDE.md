@@ -6,7 +6,7 @@ AI-driven art authentication and lost manuscript discovery. Collection-scale scr
 
 ## Status
 
-**Active — prototype phase.** Approach validated in research. Building first prototype on Colab Pro.
+**Local pipeline complete (v1 + v2).** Met expansion done — circle N=2→18. Core finding: DINOv2 ViT-B/14 is a "different artist" detector (pupils p=2e-11, other Dutch p=3e-10) but **cannot separate circle/style-of from autograph** (p=0.80 at N=18). High-res + std features (v2) made things worse — collapsed all similarities toward 0.90. Next: try ViT-L/14 (option C) and entropy-weighted tiles (option D).
 
 ## Thesis
 
@@ -70,6 +70,10 @@ Never "authenticate." Only "screen and flag for expert review." This reduces lia
 | File | Contents |
 |---|---|
 | `prototype.ipynb` | **Phase 1 prototype.** DINOv2 embedding pipeline on Rijksmuseum Rembrandt corpus. Run on Colab Pro (T4). |
+| `scan.py` | **Local pipeline.** Rijksmuseum + Met Open Access. Three-tier cache (metadata→images→embeddings). MPS device. Run with `python scan.py` or `--stage N`. `--hires` for v2 (high-res + std features). |
+| `scan-results.md` | **Local pipeline results.** v1 vs v2 comparison, key findings, next steps (C/D/E/F). |
+| `prototype-results.md` | **Colab prototype results.** Original Rijksmuseum-only metrics + API discoveries. |
+| `business-plan.md` | **Attribution Alpha fund.** Buy misattributed works, reattribute, sell. Phased capital deployment. |
 | `research.md` | Opportunity landscape — art authentication + lost manuscripts, six gaps, monetisation paths |
 | `execution.md` | Detailed execution plan — MVP pipeline, week-by-week, competitors, capital requirements, risk factors |
 
@@ -104,3 +108,7 @@ Stylometry for authorship attribution. Zero competition. Grant-fundable. Builds 
 | 2026-02-26 | Multi-artist from the start | More signals per scan. Style embedding space > single-artist classifier. |
 | 2026-02-26 | Rijksmuseum first | Largest open collection, best Rembrandt corpus, high-res IIIF API. |
 | 2026-02-26 | Colab Pro for compute | User has 50 GB local. Colab Pro gives T4 GPUs, enough for prototype + full scan. |
+| 2026-02-26 | Prototype result: weak-to-moderate signal | p=0.001 pupils, 82.9% KNN. Data bottleneck not method bottleneck. Add Met next. |
+| 2026-02-26 | Met expansion: circle still inseparable | N=18 circle, p=0.80. DINOv2 ViT-B is "different artist" detector, not authenticator. |
+| 2026-02-26 | High-res + std features (v2) hurt | All sims→0.90, lost pupil signal. Low-res mean-only (v1) is better. Revert to v1 as baseline. |
+| 2026-02-26 | Next: ViT-L/14 (C) then entropy-weighted tiles (D) | Systematic options before concluding ViT-B is ceiling. |
