@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Met Open Access Expansion — Local DINOv2 Authentication Pipeline
+Multi-Source DINOv2 Authentication Pipeline
 
-Expands Rijksmuseum-only prototype with Met Open Access data.
+Data sources: Rijksmuseum, Met Open Access, Wikidata SPARQL, NGA, CMA, AIC.
 Three-tier cache: metadata → images → embeddings.
 Each stage checks cache before running; re-runs skip completed work.
 
@@ -10,6 +10,7 @@ Usage:
     python scan.py              # full pipeline
     python scan.py --stage 1    # metadata only
     python scan.py --stage 4    # analysis only (needs prior stages cached)
+    python scan.py --refetch    # clear cache and re-fetch from all sources
 """
 
 import argparse
@@ -67,6 +68,30 @@ IIIF_BASE = "https://iiif.micr.io"
 
 # Met
 MET_BASE = "https://collectionapi.metmuseum.org/public/collection/v1"
+
+# Wikidata
+WD_SPARQL_URL = "https://query.wikidata.org/sparql"
+WD_UA = "AuthScanner/1.0 (art authentication research; contact: github.com/david-fitzgerald)"
+WD_REMBRANDT = "Q5598"
+WD_CONTROL_ARTISTS = {
+    "Ferdinand Bol": ("Q374039", "rembrandt_pupil"),
+    "Govert Flinck": ("Q550401", "rembrandt_pupil"),
+    "Jan Lievens": ("Q430783", "rembrandt_pupil"),
+    "Frans Hals": ("Q167654", "dutch_other"),
+    "Johannes Vermeer": ("Q41264", "dutch_other"),
+}
+# P1774=workshop, P1775=follower, P1776=circle, P1777=manner, P1780=school
+WD_CIRCLE_QUALIFIERS = ["P1774", "P1775", "P1776", "P1777", "P1780"]
+WD_QUALIFIER_LABELS = {
+    "P1774": "workshop", "P1775": "style", "P1776": "circle",
+    "P1777": "style", "P1780": "school",
+}
+
+# Museum APIs (supplementary)
+NGA_API_BASE = "https://api.nga.gov/art/search"
+CMA_API_BASE = "https://openaccess-api.clevelandart.org/api/artworks"
+AIC_API_BASE = "https://api.artic.edu/api/v1/artworks/search"
+AIC_IIIF_BASE = "https://www.artic.edu/iiif/2"
 
 # Attribution classification
 ATTRIBUTION_PATTERNS = {
@@ -315,6 +340,268 @@ def met_artist_group(artist_name, artist_prefix, query_group=None):
 
 
 # ---------------------------------------------------------------------------
+# Wikidata helpers
+# ---------------------------------------------------------------------------
+
+def wd_sparql(query):
+    """POST SPARQL query to Wikidata. Returns list of result bindings."""
+    for attempt in range(3):
+        try:
+            delay = RATE_LIMIT * (2 ** attempt) if attempt > 0 else RATE_LIMIT
+            time.sleep(delay)
+            resp = requests.post(WD_SPARQL_URL,
+                data={"query": query},
+                headers={"User-Agent": WD_UA, "Accept": "application/sparql-results+json"},
+                timeout=120)
+            if resp.status_code == 429:
+                print("  Wikidata rate limited, backing off...")
+                continue
+            if resp.status_code != 200:
+                print(f"  Wikidata SPARQL HTTP {resp.status_code}")
+                return []
+            # Wikidata sometimes includes control chars in labels
+            data = json.loads(resp.text, strict=False)
+            return data.get("results", {}).get("bindings", [])
+        except (requests.RequestException, json.JSONDecodeError) as e:
+            print(f"  Wikidata SPARQL error (attempt {attempt+1}): {e}")
+    return []
+
+
+def wd_image_url(commons_url, width=2000):
+    """Convert Wikimedia Commons file URL to a sized thumbnail URL.
+
+    Input:  http://commons.wikimedia.org/wiki/Special:FilePath/Foo.jpg
+    Output: https://upload.wikimedia.org/wikipedia/commons/thumb/hash/Foo.jpg/{width}px-Foo.jpg
+    """
+    # Commons P18 URLs are Special:FilePath redirects — just append ?width=
+    if "Special:FilePath" in commons_url:
+        return f"{commons_url}?width={width}"
+    # Direct upload URL — add /thumb/ variant
+    return f"{commons_url}?width={width}"
+
+
+def wd_fetch_circle_paintings():
+    """Fetch circle/workshop/follower/manner/school Rembrandt paintings from Wikidata."""
+    query = f"""SELECT ?painting ?paintingLabel ?image ?qualLabel WHERE {{
+  ?painting p:P170 ?stmt .
+  ?painting wdt:P31 wd:Q3305213 .
+  ?painting wdt:P18 ?image .
+  {{
+    ?stmt pq:P1774 wd:{WD_REMBRANDT} . BIND("workshop" AS ?qualLabel)
+  }} UNION {{
+    ?stmt pq:P1775 wd:{WD_REMBRANDT} . BIND("follower" AS ?qualLabel)
+  }} UNION {{
+    ?stmt pq:P1776 wd:{WD_REMBRANDT} . BIND("circle" AS ?qualLabel)
+  }} UNION {{
+    ?stmt pq:P1777 wd:{WD_REMBRANDT} . BIND("manner" AS ?qualLabel)
+  }} UNION {{
+    ?stmt pq:P1780 wd:{WD_REMBRANDT} . BIND("school" AS ?qualLabel)
+  }}
+  SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en" }}
+}}"""
+    bindings = wd_sparql(query)
+    # Deduplicate by QID (UNION can produce duplicate rows)
+    seen = set()
+    results = []
+    for b in bindings:
+        qid = b["painting"]["value"].split("/")[-1]
+        if qid in seen:
+            continue
+        seen.add(qid)
+        qual = b.get("qualLabel", {}).get("value", "circle")
+        # Map Wikidata qualifier to our attribution levels
+        attrib_map = {"workshop": "workshop", "follower": "style",
+                      "circle": "circle", "manner": "style", "school": "school"}
+        results.append({
+            "qid": qid,
+            "title": b.get("paintingLabel", {}).get("value", ""),
+            "image": b.get("image", {}).get("value", ""),
+            "attribution": attrib_map.get(qual, "circle"),
+            "wd_qualifier": qual,
+        })
+    return results
+
+
+def wd_fetch_autograph_paintings():
+    """Fetch autograph Rembrandt paintings from Wikidata (direct P170, no qualifier)."""
+    query = f"""SELECT ?painting ?paintingLabel ?image WHERE {{
+  ?painting wdt:P170 wd:{WD_REMBRANDT} .
+  ?painting wdt:P31 wd:Q3305213 .
+  ?painting wdt:P18 ?image .
+  FILTER NOT EXISTS {{
+    ?painting p:P170 ?stmt .
+    {{ ?stmt pq:P1774 wd:{WD_REMBRANDT} }} UNION {{ ?stmt pq:P1775 wd:{WD_REMBRANDT} }}
+    UNION {{ ?stmt pq:P1776 wd:{WD_REMBRANDT} }} UNION {{ ?stmt pq:P1777 wd:{WD_REMBRANDT} }}
+    UNION {{ ?stmt pq:P1780 wd:{WD_REMBRANDT} }}
+  }}
+  SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en" }}
+}}"""
+    bindings = wd_sparql(query)
+    seen = set()
+    results = []
+    for b in bindings:
+        qid = b["painting"]["value"].split("/")[-1]
+        if qid in seen:
+            continue
+        seen.add(qid)
+        results.append({
+            "qid": qid,
+            "title": b.get("paintingLabel", {}).get("value", ""),
+            "image": b.get("image", {}).get("value", ""),
+        })
+    return results
+
+
+def wd_fetch_control_paintings():
+    """Fetch paintings by control artists (pupils + other Dutch masters) from Wikidata."""
+    all_results = []
+    for artist_name, (qid, group) in WD_CONTROL_ARTISTS.items():
+        query = f"""SELECT ?painting ?paintingLabel ?image WHERE {{
+  ?painting wdt:P170 wd:{qid} .
+  ?painting wdt:P31 wd:Q3305213 .
+  ?painting wdt:P18 ?image .
+  SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en" }}
+}}"""
+        bindings = wd_sparql(query)
+        seen = set()
+        count = 0
+        for b in bindings:
+            painting_qid = b["painting"]["value"].split("/")[-1]
+            if painting_qid in seen:
+                continue
+            seen.add(painting_qid)
+            all_results.append({
+                "qid": painting_qid,
+                "title": b.get("paintingLabel", {}).get("value", ""),
+                "image": b.get("image", {}).get("value", ""),
+                "artist_name": artist_name,
+                "artist_group": group,
+            })
+            count += 1
+        print(f"    {artist_name}: {count} paintings")
+    return all_results
+
+
+# ---------------------------------------------------------------------------
+# Museum API helpers (supplementary — fill gaps not on Wikidata)
+# ---------------------------------------------------------------------------
+
+def nga_fetch_paintings(query="Rembrandt"):
+    """Search NGA API for paintings. Returns list of row dicts."""
+    results = []
+    resp = fetch_with_retry(NGA_API_BASE, params={
+        "exactArtist": query,
+        "artType": "painting",
+        "hasImage": "true",
+        "limit": 100,
+    })
+    if resp is None:
+        return results
+    try:
+        data = json.loads(resp.text, strict=False)
+    except json.JSONDecodeError:
+        return results
+    for item in data.get("results", []):
+        title = item.get("title", "")
+        creator = item.get("artist", "")
+        image_url = item.get("iiifUrl", "") or item.get("imageUrl", "")
+        if not image_url:
+            continue
+        attrib = classify_attribution(creator)
+        if "rembrandt" in creator.lower():
+            group = "rembrandt_autograph" if attrib == "autograph" else "rembrandt_circle"
+        else:
+            continue  # Only Rembrandt-related for now
+        obj_id = item.get("id", item.get("objectId", ""))
+        results.append({
+            "obj_id": f"nga_{obj_id}",
+            "source": "nga",
+            "title": title,
+            "creator": creator,
+            "date": item.get("date", ""),
+            "image_url": image_url,
+            "artist_group": group,
+            "attribution": attrib,
+        })
+    return results
+
+
+def cma_search(query="Rembrandt"):
+    """Search Cleveland Museum of Art API. Returns list of row dicts."""
+    results = []
+    data = fetch_json(CMA_API_BASE, params={
+        "q": query,
+        "type": "painting",
+        "has_image": 1,
+        "limit": 100,
+    })
+    if not data:
+        return results
+    for item in data.get("data", []):
+        # CMA uses creators array with qualifier field
+        creators = item.get("creators", [])
+        if not creators:
+            continue
+        creator_obj = creators[0]
+        creator_name = creator_obj.get("description", "")
+        qualifier = creator_obj.get("qualifier", "")
+        if "rembrandt" not in creator_name.lower():
+            continue
+        image_url = item.get("images", {}).get("web", {}).get("url", "")
+        if not image_url:
+            continue
+        attrib = classify_attribution(f"{qualifier} {creator_name}" if qualifier else creator_name)
+        group = "rembrandt_autograph" if attrib == "autograph" else "rembrandt_circle"
+        obj_id = item.get("id", "")
+        results.append({
+            "obj_id": f"cma_{obj_id}",
+            "source": "cma",
+            "title": item.get("title", ""),
+            "creator": f"{qualifier} {creator_name}".strip() if qualifier else creator_name,
+            "date": item.get("creation_date", ""),
+            "image_url": image_url,
+            "artist_group": group,
+            "attribution": attrib,
+        })
+    return results
+
+
+def aic_search(query="Rembrandt"):
+    """Search Art Institute of Chicago API. Returns list of row dicts."""
+    results = []
+    data = fetch_json(AIC_API_BASE, params={
+        "q": query,
+        "query[term][classification_titles]": "painting",
+        "fields": "id,title,artist_display,image_id,date_display",
+        "limit": 100,
+    })
+    if not data:
+        return results
+    for item in data.get("data", []):
+        artist = item.get("artist_display", "")
+        if "rembrandt" not in artist.lower():
+            continue
+        image_id = item.get("image_id")
+        if not image_id:
+            continue
+        image_url = f"{AIC_IIIF_BASE}/{image_id}/full/!2000,2000/0/default.jpg"
+        attrib = classify_attribution(artist)
+        group = "rembrandt_autograph" if attrib == "autograph" else "rembrandt_circle"
+        obj_id = item.get("id", "")
+        results.append({
+            "obj_id": f"aic_{obj_id}",
+            "source": "aic",
+            "title": item.get("title", ""),
+            "creator": artist,
+            "date": item.get("date_display", ""),
+            "image_url": image_url,
+            "artist_group": group,
+            "attribution": attrib,
+        })
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Stage 1: Fetch Painting Inventory
 # ---------------------------------------------------------------------------
 
@@ -519,6 +806,157 @@ def stage1_metadata():
 
     print(f"  Met: {met_added} paintings ({met_skipped} skipped)")
 
+    # --- Wikidata: circle/workshop paintings ---
+    print("[Stage 1] Fetching Wikidata circle/workshop paintings...")
+    wd_circle = wd_fetch_circle_paintings()
+    wd_circle_added = 0
+    for p in wd_circle:
+        cache_file = CACHE_META / f"wd_{p['qid']}.json"
+        if cache_file.exists():
+            cached = json.loads(cache_file.read_text())
+            if cached.get("_skip"):
+                continue
+            title_key = cached.get("title", "").lower().strip()
+            if title_key and title_key in seen_titles:
+                continue
+            rows.append(cached)
+            seen_titles.add(title_key)
+            wd_circle_added += 1
+            continue
+
+        title_key = p["title"].lower().strip()
+        if title_key and title_key in seen_titles:
+            cache_file.write_text(json.dumps({"_skip": True}))
+            continue
+
+        image_url = wd_image_url(p["image"])
+        row = {
+            "obj_id": f"wd_{p['qid']}",
+            "source": "wikidata",
+            "title": p["title"],
+            "creator": f"{p['wd_qualifier']} of Rembrandt",
+            "date": "",
+            "image_url": image_url,
+            "artist_group": "rembrandt_circle",
+            "attribution": p["attribution"],
+        }
+        rows.append(row)
+        seen_titles.add(title_key)
+        wd_circle_added += 1
+        cache_file.write_text(json.dumps(row, ensure_ascii=False))
+    print(f"  Wikidata circle: {wd_circle_added} paintings (from {len(wd_circle)} SPARQL results)")
+
+    # --- Wikidata: autograph paintings ---
+    print("[Stage 1] Fetching Wikidata autograph paintings...")
+    wd_auto = wd_fetch_autograph_paintings()
+    wd_auto_added = 0
+    for p in wd_auto:
+        cache_file = CACHE_META / f"wd_{p['qid']}.json"
+        if cache_file.exists():
+            cached = json.loads(cache_file.read_text())
+            if cached.get("_skip"):
+                continue
+            title_key = cached.get("title", "").lower().strip()
+            if title_key and title_key in seen_titles:
+                continue
+            rows.append(cached)
+            seen_titles.add(title_key)
+            wd_auto_added += 1
+            continue
+
+        title_key = p["title"].lower().strip()
+        if title_key and title_key in seen_titles:
+            cache_file.write_text(json.dumps({"_skip": True}))
+            continue
+
+        image_url = wd_image_url(p["image"])
+        row = {
+            "obj_id": f"wd_{p['qid']}",
+            "source": "wikidata",
+            "title": p["title"],
+            "creator": "Rembrandt",
+            "date": "",
+            "image_url": image_url,
+            "artist_group": "rembrandt_autograph",
+            "attribution": "autograph",
+        }
+        rows.append(row)
+        seen_titles.add(title_key)
+        wd_auto_added += 1
+        cache_file.write_text(json.dumps(row, ensure_ascii=False))
+    print(f"  Wikidata autograph: {wd_auto_added} paintings (from {len(wd_auto)} SPARQL results)")
+
+    # --- Wikidata: control artists (pupils + other Dutch) ---
+    print("[Stage 1] Fetching Wikidata control artists...")
+    wd_ctrl = wd_fetch_control_paintings()
+    wd_ctrl_added = 0
+    for p in wd_ctrl:
+        cache_file = CACHE_META / f"wd_{p['qid']}.json"
+        if cache_file.exists():
+            cached = json.loads(cache_file.read_text())
+            if cached.get("_skip"):
+                continue
+            title_key = cached.get("title", "").lower().strip()
+            if title_key and title_key in seen_titles:
+                continue
+            rows.append(cached)
+            seen_titles.add(title_key)
+            wd_ctrl_added += 1
+            continue
+
+        title_key = p["title"].lower().strip()
+        if title_key and title_key in seen_titles:
+            cache_file.write_text(json.dumps({"_skip": True}))
+            continue
+
+        image_url = wd_image_url(p["image"])
+        row = {
+            "obj_id": f"wd_{p['qid']}",
+            "source": "wikidata",
+            "title": p["title"],
+            "creator": p["artist_name"],
+            "date": "",
+            "image_url": image_url,
+            "artist_group": p["artist_group"],
+            "attribution": "autograph",
+        }
+        rows.append(row)
+        seen_titles.add(title_key)
+        wd_ctrl_added += 1
+        cache_file.write_text(json.dumps(row, ensure_ascii=False))
+    print(f"  Wikidata control: {wd_ctrl_added} paintings (from {len(wd_ctrl)} SPARQL results)")
+
+    # --- Museum APIs (supplementary) ---
+    print("[Stage 1] Fetching museum API paintings (NGA, CMA, AIC)...")
+    museum_added = 0
+    for label, fetch_fn in [("NGA", nga_fetch_paintings), ("CMA", cma_search), ("AIC", aic_search)]:
+        try:
+            museum_rows = fetch_fn()
+        except Exception as e:
+            print(f"  {label}: error — {e}")
+            continue
+        source_added = 0
+        for row in museum_rows:
+            title_key = row["title"].lower().strip()
+            if title_key and title_key in seen_titles:
+                continue
+            cache_file = CACHE_META / f"{row['obj_id']}.json"
+            if cache_file.exists():
+                cached = json.loads(cache_file.read_text())
+                if cached.get("_skip"):
+                    continue
+                rows.append(cached)
+                seen_titles.add(title_key)
+                source_added += 1
+                continue
+            rows.append(row)
+            seen_titles.add(title_key)
+            source_added += 1
+            cache_file.write_text(json.dumps(row, ensure_ascii=False))
+        museum_added += source_added
+        print(f"  {label}: {source_added} paintings added")
+    print(f"  Museum APIs total: {museum_added} paintings")
+
     # --- Deduplicate and save ---
     seen_obj_ids = set()
     deduped = []
@@ -602,8 +1040,8 @@ def stage2_images(rows, hires=False):
                     scale = IMG_HIRES_MAX_PX / max(w, h)
                     img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
             else:
-                # v1 behavior: resize Met to 2000px
-                if row["source"] == "met" and max(w, h) > IMG_MAX_PX:
+                # v1 behavior: resize non-Rijksmuseum to 2000px
+                if row["source"] != "rijksmuseum" and max(w, h) > IMG_MAX_PX:
                     scale = IMG_MAX_PX / max(w, h)
                     img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
             img.save(img_path, "JPEG", quality=95)
@@ -1326,6 +1764,8 @@ def main():
                         help="Option D: entropy-weighted tile aggregation")
     parser.add_argument("--probe", action="store_true",
                         help="Option F: linear probe on frozen embeddings (autograph vs circle)")
+    parser.add_argument("--refetch", action="store_true",
+                        help="Delete cached inventory + embeddings to force re-fetch from all sources")
     args = parser.parse_args()
     hires = args.hires
     model_name = args.model
@@ -1334,6 +1774,24 @@ def main():
 
     for d in [CACHE_META, CACHE_IMG, CACHE_IMG_HIRES, CACHE_EMB, CACHE_PLOTS]:
         d.mkdir(parents=True, exist_ok=True)
+
+    if args.refetch:
+        for f in [INVENTORY_CSV, EMBEDDINGS_NPZ, EMBEDDINGS_V2_NPZ,
+                  EMBEDDINGS_VITL_NPZ, EMBEDDINGS_ENTROPY_NPZ,
+                  EMBEDDINGS_ENTROPY_VITL_NPZ]:
+            if f.exists():
+                f.unlink()
+                print(f"  Deleted {f.name}")
+        # Delete per-source metadata caches so Wikidata/museum results re-fetch
+        for f in CACHE_META.glob("wd_*.json"):
+            f.unlink()
+        for f in CACHE_META.glob("nga_*.json"):
+            f.unlink()
+        for f in CACHE_META.glob("cma_*.json"):
+            f.unlink()
+        for f in CACHE_META.glob("aic_*.json"):
+            f.unlink()
+        print("[Refetch] Cleared cached data — will re-fetch from all sources")
 
     # --probe: load cached v1 embeddings, run linear probe, exit
     if probe:
