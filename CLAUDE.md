@@ -39,7 +39,7 @@ AI-driven art authentication via DINOv2 embeddings. Collection-scale screening â
 
 ## Status
 
-**Linear probe confirms supervised signal exists.** LOO accuracy 72.3%, permutation p=0.015. Unsupervised configs all failed (best p=0.615) but a thin supervised layer finds the boundary. Signal is real but weak â€” next: more data (option G) and non-linear probes (option H).
+**Features tapped out â€” more data needed.** Non-linear probes (SVM RBF 66.0%, MLP 72.3%) fail to beat logistic regression (72.3%, p=0.015). Frozen DINOv2 embeddings contain no untapped non-linear signal. Next: more data (option G).
 
 ## Decisions Log
 
@@ -54,6 +54,7 @@ AI-driven art authentication via DINOv2 embeddings. Collection-scale screening â
 | 2026-03-01 | ViT-L/14 (option C) eliminated | Circle p=0.831 (worse). Model capacity not the bottleneck. |
 | 2026-03-01 | Entropy-weighted tiles (option D) eliminated | Circle p=0.615 (marginal). Pupil p collapsed. Aggregation not the bottleneck. Next: linear probe (F). |
 | 2026-03-01 | Linear probe (option F): signal confirmed | 72.3% LOO, perm p=0.015. Supervised signal exists in frozen DINOv2 features. Weak but real. |
+| 2026-03-01 | Non-linear probes (option H): features tapped out | SVM RBF 66.0%, MLP 72.3% â€” no gain over logistic. Bottleneck is data quantity, not classifier capacity. |
 
 ## Conventions
 
