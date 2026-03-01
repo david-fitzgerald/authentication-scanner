@@ -39,7 +39,7 @@ AI-driven art authentication via DINOv2 embeddings. Collection-scale screening â
 
 ## Status
 
-**Unsupervised DINOv2 features exhausted.** Circle/autograph inseparable across all four configs (v1, v2, ViT-L, entropy). Next: linear probe (option F) â€” supervised learning on frozen embeddings.
+**Linear probe confirms supervised signal exists.** LOO accuracy 72.3%, permutation p=0.015. Unsupervised configs all failed (best p=0.615) but a thin supervised layer finds the boundary. Signal is real but weak â€” next: more data (option G) and non-linear probes (option H).
 
 ## Decisions Log
 
@@ -53,6 +53,7 @@ AI-driven art authentication via DINOv2 embeddings. Collection-scale screening â
 | 2026-02-26 | High-res + std features (v2) hurt | All simsâ†’0.90, lost pupil signal. Low-res mean-only (v1) is better. |
 | 2026-03-01 | ViT-L/14 (option C) eliminated | Circle p=0.831 (worse). Model capacity not the bottleneck. |
 | 2026-03-01 | Entropy-weighted tiles (option D) eliminated | Circle p=0.615 (marginal). Pupil p collapsed. Aggregation not the bottleneck. Next: linear probe (F). |
+| 2026-03-01 | Linear probe (option F): signal confirmed | 72.3% LOO, perm p=0.015. Supervised signal exists in frozen DINOv2 features. Weak but real. |
 
 ## Conventions
 

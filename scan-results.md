@@ -1,5 +1,5 @@
 ---
-version: 0.4.0
+version: 0.5.0
 date: 2026-03-01
 status: complete
 ---
@@ -130,34 +130,64 @@ Circle/disputed group expanded from N=2 (prototype) to N=18 — the primary goal
 | KNN K=7 | 75.9% |
 | Baseline | 73.1% |
 
-## Comparison: Prototype → v1 → v2 → v1-L → v1-D
+## Comparison: Prototype → v1 → v2 → v1-L → v1-D → v1-F
 
-| Metric | Prototype (RIJ only) | v1 ViT-B | v2 (high-res) | v1-L ViT-L | v1-D Entropy |
-|--------|---------------------|----------|---------------|------------|--------------|
-| N paintings | 70 | 108 | 101 | 108 | 108 |
-| N circle | 2 | 18 | 18 | 18 | 18 |
-| Circle p-value | 0.088 (N=2) | 0.805 | 0.335 | 0.831 | **0.615** |
-| Pupils p-value | 0.001 | 2.03e-11 | 0.146 | 3.59e-11 | 3.70e-02 |
-| Other p-value | 0.002 | 3.40e-10 | 7.36e-15 | 8.85e-08 | 1.02e-06 |
-| KNN best | 82.9% | 77.8% | 68.3% | 75.9% | 78.7% |
-| KNN baseline | 72.9% | 73.1% | 71.3% | 73.1% | 73.1% |
-| Embed dim | 1536 | 1536 | 3072 | 2048 | 1536 |
+| Metric | Prototype | v1 ViT-B | v2 (high-res) | v1-L ViT-L | v1-D Entropy | v1-F Probe |
+|--------|-----------|----------|---------------|------------|--------------|------------|
+| N paintings | 70 | 108 | 101 | 108 | 108 | 47 (auto+circle) |
+| N circle | 2 | 18 | 18 | 18 | 18 | 18 |
+| Circle metric | p=0.088 | p=0.805 | p=0.335 | p=0.831 | p=0.615 | **72.3% LOO, p=0.015** |
+| Pupils p-value | 0.001 | 2.03e-11 | 0.146 | 3.59e-11 | 3.70e-02 | — |
+| Other p-value | 0.002 | 3.40e-10 | 7.36e-15 | 8.85e-08 | 1.02e-06 | — |
+| KNN best | 82.9% | 77.8% | 68.3% | 75.9% | 78.7% | — |
+| KNN baseline | 72.9% | 73.1% | 71.3% | 73.1% | 73.1% | — |
+| Embed dim | 1536 | 1536 | 3072 | 2048 | 1536 | 1536→PCA 20 |
+| Method | unsupervised | unsupervised | unsupervised | unsupervised | unsupervised | **supervised** |
 
 ## Key Findings
 
-1. **Circle/autograph separation does not exist in DINOv2 features — regardless of model size or aggregation method.** Tested ViT-B/14, ViT-L/14 (3.5× larger), and entropy-weighted aggregation. Best circle p=0.615 (entropy). Four experiments, none below 0.3.
+1. **Supervised signal exists for circle/autograph — unsupervised methods can't find it.** The linear probe (Option F) achieves 72.3% LOO accuracy with permutation p=0.015. Four unsupervised configs (v1, v2, ViT-L, entropy) all failed (best p=0.615). The autograph/circle boundary is a learned linear combination across PCA components, not a cosine distance.
 
-2. **Entropy weighting trades pupil signal for marginal circle improvement.** Circle p improved 0.805→0.615 but pupil p collapsed from 2e-11→0.037 (five orders of magnitude worse). The weighting amplifies noise in complex tiles, not style signal. All similarities dropped ~0.05 uniformly.
+2. **The signal is real but weak.** 72.3% is 20 points above the null (51.9%) — statistically significant, not practically sufficient. At N=47 with 1536d features, even PCA-reduced logistic regression is operating at the edge. More data or a non-linear classifier may help.
 
-3. **Aggregation is not the bottleneck.** Mean pooling wasn't washing out discriminative signal — the signal for circle/autograph separation simply isn't in generic DINOv2 embeddings. Confirmed by entropy weighting making things worse overall despite being non-trivially different (max/uniform weight ratios up to 10.5×).
+3. **Entropy weighting trades pupil signal for marginal circle improvement.** Circle p improved 0.805→0.615 but pupil p collapsed from 2e-11→0.037. The weighting amplifies noise in complex tiles, not style signal.
 
-4. **High-res hurts more than it helps (v2).** All similarities pushed toward 0.90, collapsing between-group discrimination. The std features add noise.
+4. **Aggregation and model capacity are not the bottleneck.** Mean pooling (v1), entropy weighting (D), ViT-L (C), and high-res (v2) all fail at circle/autograph. The information is in the features but requires a learned projection to access.
 
-5. **ViT-L shifts all similarities upward uniformly.** Bigger model sees Rembrandt-school paintings as more alike, not less. Doesn't resolve within-school differences.
+5. **High-res hurts more than it helps (v2).** All similarities pushed toward 0.90, collapsing between-group discrimination. The std features add noise.
 
-6. **Pupil/other separation is real and robust — but only with v1 ViT-B baseline.** p=2e-11 for pupils and 3e-10 for other Dutch masters. Every variation tested (v2, ViT-L, entropy) degrades this signal. DINOv2 ViT-B mean pooling is the sweet spot for "different artist" detection.
+6. **Pupil/other separation is real and robust — but only with v1 ViT-B baseline.** p=2e-11 for pupils and 3e-10 for other Dutch masters. DINOv2 ViT-B mean pooling is the sweet spot for "different artist" detection.
 
-7. **The scanner is a "different artist" detector, not an authenticator.** Four feature configurations all confirm this. The circle/autograph question requires supervised learning, not better unsupervised features.
+7. **The scanner is a "different artist" detector, not an authenticator — but supervised methods partially close the gap.** Unsupervised features separate distinct artists but not quality levels within the Rembrandt school. A thin supervised layer finds some of this boundary.
+
+## v1-F: Linear probe on frozen embeddings (supervised)
+
+**Config:** Filter to autograph (N=29) + circle (N=18) = 47 paintings. PCA dimensionality reduction → L2-regularized logistic regression → leave-one-out cross-validation. Grid search over PCA dims [10, 20] and C=[0.001, 0.01, 0.1, 1.0, 10.0]. Permutation test (1000 shuffles) on best config for proper p-value.
+
+**Why PCA first:** At 1536 features and 47 samples, logistic regression can perfectly separate any random labeling. PCA to 10–20 dims compresses noise dimensions, making LOO accuracy meaningful.
+
+### Grid search results
+
+| PCA dims | C=0.001 | C=0.01 | C=0.1 | C=1.0 | C=10.0 |
+|----------|---------|--------|-------|-------|--------|
+| 10 | 0.617 | 0.681 | 0.681 | 0.660 | 0.660 |
+| 20 | 0.617 | 0.681 | **0.723** | 0.681 | 0.660 |
+
+### Best config
+
+| Metric | Value |
+|--------|-------|
+| PCA dims | 20 |
+| Regularization C | 0.1 |
+| LOO accuracy | **72.3%** |
+| Permutation p-value | **0.015** |
+| Null mean ± std | 0.519 ± 0.085 |
+
+### Interpretation
+
+The permutation test is definitive: p=0.015 means only 1.5% of random label shuffles scored ≥72.3%. The supervised signal is real. DINOv2 *does* encode autograph/circle differences — but the boundary is a learned linear combination across 20 PCA components, not a simple cosine distance.
+
+72.3% accuracy is moderate — well above the null (51.9%) but below the 85%+ needed for practical screening. The gap between null and real accuracy (~20 percentage points) suggests signal exists but is weak relative to the noise floor at N=47.
 
 ## Eliminated Options
 
@@ -166,15 +196,18 @@ Circle/disputed group expanded from N=2 (prototype) to N=18 — the primary goal
 | v2: High-res + std | All sims→0.90, lost pupil signal | More tiles + std features add noise |
 | C: ViT-L/14 | Circle p=0.831, worse than ViT-B | Model capacity is not the bottleneck |
 | D: Entropy-weighted tiles | Circle p=0.615, pupil p collapsed 2e-11→0.037 | Aggregation is not the bottleneck |
+| F: Linear probe | 72.3% LOO, perm p=0.015 | Signal exists but weak — not enough for practical screening at N=47 |
 
 ## Next Steps
 
 | # | Approach | Hypothesis | Effort |
 |---|----------|-----------|--------|
-| F | **Linear probe** | Thin supervised layer on frozen DINOv2 embeddings learns circle/autograph boundary | ~2 hr |
-| E | **Per-tile classification** | Instead of mean pooling, classify individual tiles and vote | ~2 hr |
+| E | **Per-tile classification** | Classify individual tiles and vote — bypasses mean-pooling information loss | ~2 hr |
+| G | **More data** | N=47 is marginal. Expand circle corpus (Wallace Collection, National Gallery, Louvre) to N=50+ | ~4 hr |
+| H | **Non-linear probe (SVM/MLP)** | RBF SVM or small MLP may find non-linear boundary that logistic regression misses | ~2 hr |
+| I | **Fine-tune DINOv2** | LoRA or last-layer fine-tuning on authentication labels — but N=47 is dangerously small | ~8 hr |
 
-Recommendation: F next — unsupervised features exhausted (v2, C, D all failed). Supervised signal is the next logical step.
+Recommendation: G next — the probe confirmed signal exists but 72.3% at N=47 is at the edge of what's learnable. More circle paintings would both improve accuracy and make the permutation test more powerful. E and H are worth trying in parallel.
 
 ## Files
 
@@ -188,4 +221,5 @@ Recommendation: F next — unsupervised features exhausted (v2, C, D all failed)
 | `cache/results_v2.json` | v2 metrics |
 | `cache/results_vitl.json` | v1-L ViT-L metrics |
 | `cache/results_entropy.json` | v1-D entropy-weighted metrics |
+| `cache/results_probe.json` | v1-F linear probe metrics |
 | `cache/plots/` | UMAP, cosine, heatmap for latest run |
