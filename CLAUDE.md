@@ -40,7 +40,7 @@ AI-driven art authentication via DINOv2 embeddings. Collection-scale screening �
 
 ## Status
 
-**Frozen features plateau at 63.7% balanced accuracy.** Dataset expanded to 1311 paintings via Wikidata SPARQL. Best probe: entropy-weighted SVM RBF 63.7%, p=0.001. ViT-B mean: 59.0%, ViT-L: 59.5%. Entropy weighting is worst unsupervised but best supervised. Next: fine-tuning (Option I).
+**Best result: 63.7% balanced accuracy (entropy SVM RBF, frozen features).** Fine-tuning (Option I) didn't help — 60.0% ± 5.0%, overfits on N=568. Concat (K) also below entropy alone. Rembrandt-only data is exhausted. Next: multi-artist transfer learning (Tier 3) or pivot to "wrong artist" detector (Option N).
 
 ## Decisions Log
 
@@ -59,6 +59,8 @@ AI-driven art authentication via DINOv2 embeddings. Collection-scale screening �
 | 2026-03-01 | Option G: Wikidata SPARQL dataset expansion | 1311 paintings (was ~108). Circle 149, autograph 562, pupil 327, dutch_other 273. Wikidata primary source. |
 | 2026-03-02 | Option G probe: frozen features plateau at 59% | Balanced 10-fold: SVM RBF 59.0%, p=0.003. N=47 LOO (72.3%) was overfit. Unsupervised circle p went from 0.805→~0.000 with 8× more data. |
 | 2026-03-02 | C/D re-run on expanded data | ViT-L: 59.5% (no gain). Entropy: **63.7%** — best frozen-feature probe. Entropy worst unsupervised but best supervised. |
+| 2026-03-02 | K: Concat embeddings | 62.3% — diluted entropy signal. PCA too aggressive on 5120d. |
+| 2026-03-03 | I: Fine-tune eliminated | 60.0% ± 5.0% — overfits by epoch 10, doesn't beat frozen entropy (63.7%). N=568 too small for 14M params. |
 
 ## Conventions
 

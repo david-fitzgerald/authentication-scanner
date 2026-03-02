@@ -222,6 +222,7 @@ This eliminates classifier capacity as a variable. The 72.3% ceiling is a featur
 | C re-run (ViT-L, N=711) | 59.5% bal acc, lost "other Dutch" (p=0.249) | Model capacity still not the bottleneck |
 | D re-run (entropy, N=711) | **63.7% bal acc** — best probe config | Entropy helps supervised but destroys unsupervised pupil/other |
 | K: Concat (B+L+entropy, 5120d) | 62.3% bal acc (Logistic, p=0.001) | Concatenation diluted entropy signal. PCA 20 from 5120d too aggressive. |
+| I: Fine-tune (last 2 blocks) | 60.0% ± 5.0% (5-fold CV) | Overfits by epoch 10, doesn't beat frozen entropy. N=568 too small for 14M params. |
 
 ## Next Steps
 
@@ -233,8 +234,6 @@ This eliminates classifier capacity as a variable. The 72.3% ceiling is a featur
 | E | **Per-tile classification** | Classify individual tiles and vote — bypasses mean-pooling information loss. Each painting → ~64 training examples. | ~2 hr |
 | J | **CLIP / SigLIP features** | Different foundation model may encode different visual info. CLIP trained on text-image pairs — may capture iconographic/compositional features DINOv2 misses. | ~2 hr |
 | K | **Feature concatenation** | Combine DINOv2 mean + entropy + ViT-L into one wide vector. Let classifier sort out which aggregation matters. PCA handles dimensionality. | ~1 hr |
-
-Recommendation: K first (quick win, almost free), then I (step change). E and J are incremental — maybe +2–5 points within frozen features.
 
 ### Tier 2: Beyond frozen embeddings (if I–K don't reach ~80%)
 
@@ -404,6 +403,29 @@ Permutation p = **0.001** (null mean = 0.499 ± 0.031).
 | ViT-B mean | 59.0% | 0.003 | ~0.000 |
 | ViT-L mean | 59.5% | 0.001 | ~0.000 |
 | **ViT-B entropy** | **63.7%** | **0.001** | ~0.000 |
+
+## v1-I: Fine-tune DINOv2 (Option I)
+
+**Config:** DINOv2 ViT-B/14 with last 2/12 transformer blocks unfrozen (14.2M / 86.6M params trainable). Linear classification head on CLS token. Whole paintings resized to 518×518 (DINOv2 native). Stratified 5-fold CV, WeightedRandomSampler for class balance, BCEWithLogitsLoss, AdamW (lr=5e-5, wd=0.01), cosine LR schedule, early stopping (patience=7). Batch size 4 on MPS.
+
+### Fold results
+
+| Fold | Train (auto/circle) | Val (auto/circle) | Best bal acc | Best epoch | Early stop |
+|------|--------------------|--------------------|-------------|-----------|------------|
+| 1 | 449/119 | 113/30 | 0.643 | 8 | 15 |
+| 2 | 449/120 | 113/29 | 0.670 | 5 | 12 |
+| 3 | 450/119 | 112/30 | 0.587 | 5 | 12 |
+| 4 | 450/119 | 112/30 | 0.535 | 6 | 13 |
+| 5 | 450/119 | 112/30 | 0.563 | 9 | 16 |
+| **Mean** | | | **0.600 ± 0.050** | | |
+
+### Interpretation
+
+**Fine-tuning doesn't beat frozen features.** Mean 60.0% vs frozen entropy SVM RBF 63.7%. The model memorizes training data by epoch 10 (loss → 0.0001) but val accuracy peaks in epochs 5–9 then collapses to ~50%. High fold variance (5.0% std) confirms instability.
+
+N=568 training paintings is insufficient for 14.2M trainable parameters — even with only 2 blocks unfrozen, the model has orders of magnitude more capacity than signal. The frozen entropy probe works better because PCA + SVM RBF has far fewer effective parameters (~20 PCA dims × 1 SVM boundary = ~20 effective params vs 14.2M).
+
+This confirms the Tier 3 hypothesis: the bottleneck is training data volume, not model capacity or feature representation. Multi-artist pre-training (Rubens, Cranach, Titian, etc.) is the logical next step — learn general "autograph vs workshop" features from thousands of paintings before attempting Rembrandt-specific fine-tuning.
 
 ## Files
 
