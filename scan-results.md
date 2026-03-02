@@ -148,19 +148,19 @@ Circle/disputed group expanded from N=2 (prototype) to N=18 — the primary goal
 
 1. **Data expansion confirmed the signal — and revealed the N=47 result was inflated.** At N=711, balanced accuracy is 59.0% (p=0.003) vs the N=47 LOO of 72.3% (p=0.015). More data made the permutation test more powerful (p dropped from 0.015 to 0.003) but the actual classification accuracy dropped, suggesting the 72.3% was overfit to the small sample.
 
-2. **Frozen DINOv2 features plateau at ~59% balanced accuracy on autograph/circle.** Three classifiers (logistic, SVM RBF, MLP) all score 55–59% balanced accuracy. SVM RBF (59.0%) marginally beats logistic (57.8%), indicating mild non-linear structure. This is the true ceiling for frozen embeddings.
+2. **Frozen DINOv2 features plateau at ~59–64% balanced accuracy on autograph/circle.** Standard mean pooling: 59.0% (ViT-B) / 59.5% (ViT-L). Entropy-weighted: **63.7%** — the best frozen-feature result. SVM RBF consistently outperforms logistic, indicating mild non-linear structure.
 
 3. **Data expansion unlocked unsupervised circle separation.** At N=108, circle p=0.805 (invisible). At N=1311, circle p≈0.000 (significant). The cosine similarity signal was there all along — just drowned in noise at N=18.
 
 4. **Supervised signal exists for circle/autograph — unsupervised methods can't practically use it.** Four unsupervised configs (v1, v2, ViT-L, entropy) all failed at N=108 (best p=0.615). Supervised probes find the boundary, but it's a learned combination across PCA components, not a simple cosine distance.
 
-5. **Entropy weighting trades pupil signal for marginal circle improvement.** Circle p improved 0.805→0.615 but pupil p collapsed from 2e-11→0.037. The weighting amplifies noise, not style signal.
+5. **Entropy weighting: worst unsupervised, best supervised.** At N=1311, entropy destroys pupil/other separation (both p=1.0) but produces the best probe accuracy (63.7% vs 59.0% mean). The variance-weighted tiles amplify brushwork detail that a supervised classifier can leverage but that cosine similarity cannot.
 
 6. **High-res hurts more than it helps (v2).** All similarities pushed toward 0.90, collapsing between-group discrimination. The std features add noise.
 
 7. **Pupil/other separation is real and robust.** p=2e-11 for pupils and 3e-10 for other Dutch masters (v1 ViT-B). DINOv2 is a "different artist" detector, not an authenticator.
 
-8. **Next frontier: fine-tuning or per-tile classification.** Frozen embeddings are exhausted at 59%. Options E (per-tile voting) and I (LoRA fine-tuning) are the remaining paths. With N=711, fine-tuning is now feasible where it wasn't at N=47.
+8. **Next frontier: fine-tuning.** Frozen embeddings peak at 63.7% (entropy + SVM RBF). Option I (LoRA fine-tuning) is the clear next step — with N=711, fine-tuning is feasible where it wasn't at N=47. Entropy-weighted features should be the starting point for fine-tuning experiments.
 
 ## v1-F: Linear probe on frozen embeddings (supervised)
 
@@ -219,6 +219,8 @@ This eliminates classifier capacity as a variable. The 72.3% ceiling is a featur
 | F: Linear probe (N=47) | 72.3% LOO, perm p=0.015 | Signal exists but weak at N=47 |
 | H: Non-linear probes (N=47) | SVM RBF 66.0%, MLP 72.3% — no gain over logistic | Classifier capacity is not the bottleneck |
 | G: Wikidata expansion (N=711) | 59.0% balanced acc, perm p=0.003 | Data confirmed signal but frozen features plateau at ~59% |
+| C re-run (ViT-L, N=711) | 59.5% bal acc, lost "other Dutch" (p=0.249) | Model capacity still not the bottleneck |
+| D re-run (entropy, N=711) | **63.7% bal acc** — best probe config | Entropy helps supervised but destroys unsupervised pupil/other |
 
 ## Next Steps
 
@@ -290,6 +292,74 @@ The signal is **real but modest**. 59.0% balanced accuracy with p=0.003 confirms
 At scale: DINOv2 frozen features separate autograph from circle at ~59% balanced accuracy. Better than chance (p=0.003), not good enough for practical screening (need >80%). The frozen embedding space captures some but not enough of the stylistic differences art historians use.
 
 SVM RBF slightly outperforms logistic (59.0% vs 57.8%), suggesting mild non-linear structure in the feature space — consistent with H's finding at N=47 but now with proper statistical power.
+
+## v1-G-L: ViT-L/14 on expanded dataset (Option C re-run)
+
+**Config:** Same as v1-G (2000px, mean-only) but DINOv2 ViT-L/14 (1024d per token → 2048d concatenated). Batch size 8 (vs 16 for ViT-B) to fit 8 GB unified memory.
+
+### Stage 4a: Similarity analysis
+
+| Metric | v1-G ViT-B (N=1310) | v1-G-L ViT-L (N=1310) | Change |
+|--------|---------------------|----------------------|--------|
+| Auto↔Auto sim | 0.7401 | 0.7692 | +0.029 |
+| Auto↔Circle sim | 0.7309 | 0.7583 | +0.027 |
+| MW p (vs circle) | ~0.000 | ~0.000 | = |
+| MW p (vs pupils) | ~0.000 | ~0.000 | = |
+| MW p (vs other) | ~0.000 | **0.249** | **Regressed** |
+| KNN K=3 | 69.2% | 70.7% | +1.5% |
+| KNN baseline | 57.1% | 57.1% | = |
+
+ViT-L maintains circle separation but **loses "other Dutch" discrimination** (p=0.249). At N=108, ViT-L was already worse on other Dutch (p=8.85e-8 vs 3.40e-10). At N=1311, this weakness becomes a full failure. ViT-L's larger feature space captures more general Dutch Golden Age texture, drowning out artist-specific signals for non-Rembrandt-school painters.
+
+### Stage 4b: Probe (ViT-L/14, balanced, 10-fold)
+
+| Classifier | Best PCA | Best param | 10-fold balanced acc |
+|------------|----------|------------|---------------------|
+| Logistic | 20 | C=0.001 | 0.594 |
+| **SVM RBF** | **20** | **C=1.0** | **0.595** |
+| MLP (32) | 20 | alpha=1.0 | 0.564 |
+
+Permutation p = **0.001** (null mean = 0.500 ± 0.031).
+
+**ViT-L probe (59.5%) ≈ ViT-B probe (59.0%).** The extra 512 dimensions from ViT-L add no signal for circle/autograph classification. Model capacity is confirmed not the bottleneck — consistent with the N=108 finding but now with proper statistical power.
+
+## v1-G-D: Entropy-weighted tiles on expanded dataset (Option D re-run)
+
+**Config:** Same as v1-D (2000px, ViT-B/14, entropy-weighted aggregation) but on expanded N=1311 dataset.
+
+### Stage 4a: Similarity analysis
+
+| Metric | v1-G ViT-B (N=1310) | v1-G-D Entropy (N=1310) | Change |
+|--------|---------------------|------------------------|--------|
+| Auto↔Auto sim | 0.7401 | 0.6719 | -0.068 |
+| Auto↔Circle sim | 0.7309 | 0.6496 | -0.081 |
+| MW p (vs circle) | ~0.000 | ~0.000 | = |
+| MW p (vs pupils) | ~0.000 | **1.000** | **Destroyed** |
+| MW p (vs other) | ~0.000 | **1.000** | **Destroyed** |
+| KNN K=3 | 69.2% | 70.6% | +1.4% |
+| KNN baseline | 57.1% | 57.1% | = |
+
+Entropy weighting **destroys** pupil and other Dutch separation (both p=1.0) while maintaining circle separation. Same pattern as N=108 but more extreme. Unsupervised: entropy weighting is strictly worse.
+
+### Stage 4b: Probe (entropy, balanced, 10-fold)
+
+| Classifier | Best PCA | Best param | 10-fold balanced acc |
+|------------|----------|------------|---------------------|
+| Logistic | 20 | C=0.001 | 0.611 |
+| **SVM RBF** | **20** | **C=1.0** | **0.637** |
+| MLP (32) | 10 | alpha=0.01 | 0.574 |
+
+Permutation p = **0.001** (null mean = 0.499 ± 0.031).
+
+**Surprise: entropy is the best probe configuration.** 63.7% balanced accuracy vs 59.0% (ViT-B mean) and 59.5% (ViT-L mean). The variance-weighted aggregation captures brushwork-level information that a supervised classifier can exploit — even though unsupervised cosine similarity can't. The entropy weighting amplifies high-variance tiles (faces, hands, detailed brushwork) which are exactly where art historians look for attribution differences.
+
+### Probe comparison across all configs (expanded dataset)
+
+| Config | SVM RBF balanced acc | p-value | Unsupervised circle p |
+|--------|---------------------|---------|----------------------|
+| ViT-B mean | 59.0% | 0.003 | ~0.000 |
+| ViT-L mean | 59.5% | 0.001 | ~0.000 |
+| **ViT-B entropy** | **63.7%** | **0.001** | ~0.000 |
 
 ## Files
 

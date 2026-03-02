@@ -40,7 +40,7 @@ AI-driven art authentication via DINOv2 embeddings. Collection-scale screening �
 
 ## Status
 
-**Frozen features plateau at 59% balanced accuracy (Option G complete).** Dataset expanded to 1311 paintings via Wikidata SPARQL. Balanced probe: SVM RBF 59.0%, p=0.003. Signal is real but the N=47 result (72.3%) was overfit. Unsupervised circle separation now works (p≈0.000) with 8× more data. Next: fine-tuning (Option I) or per-tile classification (Option E).
+**Frozen features plateau at 63.7% balanced accuracy.** Dataset expanded to 1311 paintings via Wikidata SPARQL. Best probe: entropy-weighted SVM RBF 63.7%, p=0.001. ViT-B mean: 59.0%, ViT-L: 59.5%. Entropy weighting is worst unsupervised but best supervised. Next: fine-tuning (Option I).
 
 ## Decisions Log
 
@@ -58,6 +58,7 @@ AI-driven art authentication via DINOv2 embeddings. Collection-scale screening �
 | 2026-03-01 | Non-linear probes (option H): features tapped out | SVM RBF 66.0%, MLP 72.3% — no gain over logistic. Bottleneck is data quantity, not classifier capacity. |
 | 2026-03-01 | Option G: Wikidata SPARQL dataset expansion | 1311 paintings (was ~108). Circle 149, autograph 562, pupil 327, dutch_other 273. Wikidata primary source. |
 | 2026-03-02 | Option G probe: frozen features plateau at 59% | Balanced 10-fold: SVM RBF 59.0%, p=0.003. N=47 LOO (72.3%) was overfit. Unsupervised circle p went from 0.805→~0.000 with 8× more data. |
+| 2026-03-02 | C/D re-run on expanded data | ViT-L: 59.5% (no gain). Entropy: **63.7%** — best frozen-feature probe. Entropy worst unsupervised but best supervised. |
 
 ## Conventions
 

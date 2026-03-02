@@ -1820,18 +1820,30 @@ def main():
             f.unlink()
         print("[Refetch] Cleared cached data — will re-fetch from all sources")
 
-    # --probe: load cached v1 embeddings, run linear probe, exit
+    # --probe: load cached embeddings, run probe, exit
     if probe:
-        print("[Mode] v1-H — probe: Logistic + SVM RBF + MLP (autograph vs circle)")
+        if entropy and model_name == "vitl14":
+            emb_path = EMBEDDINGS_ENTROPY_VITL_NPZ
+            mode_label = "entropy ViT-L/14"
+        elif entropy:
+            emb_path = EMBEDDINGS_ENTROPY_NPZ
+            mode_label = "entropy ViT-B/14"
+        elif model_name == "vitl14":
+            emb_path = EMBEDDINGS_VITL_NPZ
+            mode_label = "ViT-L/14"
+        else:
+            emb_path = EMBEDDINGS_NPZ
+            mode_label = "ViT-B/14"
+        print(f"[Mode] probe ({mode_label}): Logistic + SVM RBF + MLP (autograph vs circle)")
         if not INVENTORY_CSV.exists():
             print("ERROR: No cached inventory. Run full pipeline first.")
             sys.exit(1)
-        if not EMBEDDINGS_NPZ.exists():
-            print("ERROR: No cached v1 embeddings. Run full pipeline first.")
+        if not emb_path.exists():
+            print(f"ERROR: No cached {mode_label} embeddings. Run full pipeline first.")
             sys.exit(1)
         with open(INVENTORY_CSV) as f:
             rows = list(csv.DictReader(f))
-        data = np.load(EMBEDDINGS_NPZ, allow_pickle=True)
+        data = np.load(emb_path, allow_pickle=True)
         painting_ids = data["painting_ids"]
         cls_emb = data["cls_embeddings"]
         patch_emb = data["patch_embeddings"]
