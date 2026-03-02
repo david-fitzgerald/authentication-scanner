@@ -224,12 +224,29 @@ This eliminates classifier capacity as a variable. The 72.3% ceiling is a featur
 
 ## Next Steps
 
+### Tier 1: Remaining frozen-feature experiments
+
 | # | Approach | Hypothesis | Effort |
 |---|----------|-----------|--------|
-| E | **Per-tile classification** | Classify individual tiles and vote — bypasses mean-pooling information loss. May capture brushwork differences at tile level that averaging washes out. | ~2 hr |
-| I | **Fine-tune DINOv2** | LoRA or last-layer fine-tuning on authentication labels. N=711 now makes this feasible (was too risky at N=47). Could push past the 59% frozen-feature ceiling. | ~8 hr |
+| I | **Fine-tune DINOv2** | LoRA or last-layer fine-tuning on authentication labels. N=711 makes this feasible. Could push past the 63.7% frozen-feature ceiling. | ~8 hr |
+| E | **Per-tile classification** | Classify individual tiles and vote — bypasses mean-pooling information loss. Each painting → ~64 training examples. | ~2 hr |
+| J | **CLIP / SigLIP features** | Different foundation model may encode different visual info. CLIP trained on text-image pairs — may capture iconographic/compositional features DINOv2 misses. | ~2 hr |
+| K | **Feature concatenation** | Combine DINOv2 mean + entropy + ViT-L into one wide vector. Let classifier sort out which aggregation matters. PCA handles dimensionality. | ~1 hr |
 
-Recommendation: I next. Frozen features are exhausted at 59%. The 12× data expansion (N=711) makes fine-tuning viable. Per-tile (E) is lower risk but likely hits the same frozen-feature ceiling at the tile level.
+Recommendation: K first (quick win, almost free), then I (step change). E and J are incremental — maybe +2–5 points within frozen features.
+
+### Tier 2: Beyond frozen embeddings (if I–K don't reach ~80%)
+
+| # | Approach | What | Step change? |
+|---|----------|------|-------------|
+| L | **Diagnostic region crops** | Train on crops of known-diagnostic regions (hands, eyes, ears, fabric folds). Art historians zoom into specific areas, not whole paintings. Region detector + per-region classifier. | Maybe. Requires annotation effort. |
+| M | **Crack/canvas/pigment from high-res** | Craquelure patterns in visible-light high-res images carry age/technique signal. X-ray and infrared are gold standard but need museum access. | Possibly. Needs native-resolution museum IIIF. |
+| N | **Pivot the product** | Ship as a "wrong artist" detector (pupil/other separation is near-perfect, p≈0.000) rather than an authenticator. Catches obvious misattributions in auction catalogs and collection inventories. Position circle/autograph as research frontier. | Strategic, not technical. |
+| O | **Hybrid AI + metadata** | Combine visual features with provenance, dimensions, date, medium, subject matter. A "Rembrandt" with unusual size, uncommon support, no provenance before 1850 is already suspicious. Wikidata has much of this structured. | Likely the biggest lift. Attribution is multimodal. |
+
+**Assessment:** If I–K land at 65–70%, **N is the right move** — the pupil/other signal is already commercially useful. Even human experts disagree on autograph vs circle (the Rembrandt Research Project took 40 years). Treating authentication as pure computer vision may be pushing against a fundamental limit.
+
+If pushing the technical frontier, **O** (hybrid features) is where the real alpha is. Attribution is a multimodal problem — provenance, not pixels, is where authentication actually happens.
 
 ## v1-G: Wikidata SPARQL dataset expansion (1311 paintings)
 
