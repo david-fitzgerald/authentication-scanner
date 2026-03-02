@@ -1776,6 +1776,227 @@ def stage4b_probe(full_embeddings, artist_groups, painting_ids, rows):
 
 
 # ---------------------------------------------------------------------------
+# Option I: Fine-tune DINOv2
+# ---------------------------------------------------------------------------
+
+RESULTS_FINETUNE_JSON = CACHE_DIR / "results_finetune.json"
+
+def stage_finetune(rows):
+    """Fine-tune DINOv2 ViT-B/14 last 2 blocks + linear head for autograph vs circle.
+
+    Stratified 5-fold CV, balanced class weights, early stopping.
+    Whole paintings resized to 518×518 (DINOv2 native resolution).
+    """
+    import torch
+    import torch.nn as nn
+    from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+    from torchvision import transforms
+    from sklearn.model_selection import StratifiedKFold
+    from sklearn.metrics import balanced_accuracy_score
+
+    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    print(f"\n[Fine-tune] Device: {device}")
+
+    # Filter to autograph + circle
+    auto_circle = [(r, 1 if r["artist_group"] == "rembrandt_autograph" else 0)
+                   for r in rows if r["artist_group"] in ("rembrandt_autograph", "rembrandt_circle")]
+    print(f"[Fine-tune] {sum(y for _, y in auto_circle)} autograph + "
+          f"{sum(1 - y for _, y in auto_circle)} circle = {len(auto_circle)} paintings")
+
+    # Resolve image paths
+    img_paths = []
+    labels = []
+    for r, y in auto_circle:
+        pid = r["obj_id"]
+        path = CACHE_IMG / f"{pid}.jpg"
+        if path.exists():
+            img_paths.append(path)
+            labels.append(y)
+    labels = np.array(labels)
+    print(f"[Fine-tune] {len(img_paths)} images found")
+
+    # Transforms
+    train_transform = transforms.Compose([
+        transforms.Resize((518, 518)),
+        transforms.RandomHorizontalFlip(p=0.3),
+        transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.05),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+    val_transform = transforms.Compose([
+        transforms.Resize((518, 518)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+
+    class PaintingDataset(Dataset):
+        def __init__(self, indices, transform):
+            self.indices = indices
+            self.transform = transform
+        def __len__(self):
+            return len(self.indices)
+        def __getitem__(self, idx):
+            i = self.indices[idx]
+            img = Image.open(img_paths[i]).convert("RGB")
+            return self.transform(img), labels[i]
+
+    class FineTuneModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.backbone = torch.hub.load("facebookresearch/dinov2", "dinov2_vitb14", pretrained=True)
+            # Freeze all but last 2 blocks
+            for param in self.backbone.parameters():
+                param.requires_grad = False
+            n_blocks = len(self.backbone.blocks)
+            for block in self.backbone.blocks[n_blocks - 2:]:
+                for param in block.parameters():
+                    param.requires_grad = True
+            self.head = nn.Linear(768, 1)
+        def forward(self, x):
+            features = self.backbone(x)  # CLS token, shape (B, 768)
+            return self.head(features).squeeze(-1)
+
+    # Hyperparameters
+    lr = 5e-5
+    weight_decay = 0.01
+    epochs = 30
+    patience = 7
+    batch_size = 4  # MPS memory limited during backprop with 518x518
+
+    n_auto = int(labels.sum())
+    n_circle = len(labels) - n_auto
+
+    # Check param counts on a throwaway model
+    _m = FineTuneModel()
+    trainable = sum(p.numel() for p in _m.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in _m.parameters())
+    n_blocks = len(_m.backbone.blocks)
+    print(f"  Unfroze last 2/{n_blocks} blocks: {trainable:,} / {total:,} params trainable")
+    del _m
+
+    # 5-fold stratified CV
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    fold_results = []
+
+    for fold, (train_idx, val_idx) in enumerate(skf.split(img_paths, labels)):
+        print(f"\n  --- Fold {fold + 1}/5 ---")
+        print(f"  Train: {sum(labels[train_idx])} auto + {sum(1 - labels[train_idx])} circle = {len(train_idx)}")
+        print(f"  Val:   {sum(labels[val_idx])} auto + {sum(1 - labels[val_idx])} circle = {len(val_idx)}")
+
+        train_ds = PaintingDataset(train_idx, train_transform)
+        val_ds = PaintingDataset(val_idx, val_transform)
+
+        # Weighted sampler for class balance
+        train_labels = labels[train_idx]
+        class_counts = np.bincount(train_labels)
+        class_weights = 1.0 / class_counts
+        sample_weights = class_weights[train_labels]
+        sampler = WeightedRandomSampler(sample_weights, len(sample_weights), replacement=True)
+
+        train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=sampler, num_workers=0)
+        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
+
+        # Fresh model per fold (pretrained weights reloaded)
+        model = FineTuneModel()
+        model.to(device)
+        optimizer = torch.optim.AdamW(
+            [p for p in model.parameters() if p.requires_grad],
+            lr=lr, weight_decay=weight_decay
+        )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+        criterion = nn.BCEWithLogitsLoss()
+
+        best_val_bal_acc = 0
+        best_epoch = 0
+        no_improve = 0
+
+        for epoch in range(epochs):
+            # Train
+            model.train()
+            train_loss = 0
+            for X_batch, y_batch in train_loader:
+                X_batch = X_batch.to(device)
+                y_batch = y_batch.float().to(device)
+                optimizer.zero_grad()
+                logits = model(X_batch)
+                loss = criterion(logits, y_batch)
+                loss.backward()
+                optimizer.step()
+                train_loss += loss.item() * len(y_batch)
+            train_loss /= len(train_idx)
+            scheduler.step()
+
+            # Validate
+            model.eval()
+            val_preds, val_true = [], []
+            with torch.no_grad():
+                for X_batch, y_batch in val_loader:
+                    X_batch = X_batch.to(device)
+                    logits = model(X_batch)
+                    preds = (logits > 0).long().cpu().numpy()
+                    val_preds.extend(preds)
+                    val_true.extend(y_batch.numpy())
+            val_bal_acc = balanced_accuracy_score(val_true, val_preds)
+
+            if (epoch + 1) % 5 == 0 or epoch == 0:
+                print(f"    Epoch {epoch + 1:2d}: loss={train_loss:.4f}, val_bal_acc={val_bal_acc:.3f}")
+
+            if val_bal_acc > best_val_bal_acc:
+                best_val_bal_acc = val_bal_acc
+                best_epoch = epoch + 1
+                no_improve = 0
+            else:
+                no_improve += 1
+                if no_improve >= patience:
+                    print(f"    Early stop at epoch {epoch + 1} (best: {best_val_bal_acc:.3f} at epoch {best_epoch})")
+                    break
+
+        print(f"  Fold {fold + 1} best: {best_val_bal_acc:.3f} (epoch {best_epoch})")
+        fold_results.append({
+            "fold": fold + 1,
+            "best_val_bal_acc": round(best_val_bal_acc, 4),
+            "best_epoch": best_epoch,
+        })
+
+    # Summary
+    accs = [r["best_val_bal_acc"] for r in fold_results]
+    mean_acc = np.mean(accs)
+    std_acc = np.std(accs)
+
+    print(f"\n{'='*60}")
+    print(f"  FINE-TUNE RESULTS (Option I)")
+    print(f"{'='*60}")
+    print(f"  Model:            DINOv2 ViT-B/14 (last 2 blocks unfrozen)")
+    print(f"  Image size:       518×518")
+    print(f"  N autograph:      {n_auto}")
+    print(f"  N circle:         {n_circle}")
+    print(f"  CV:               5-fold stratified")
+    print(f"  Folds:            {', '.join(f'{a:.3f}' for a in accs)}")
+    print(f"  Mean bal acc:     {mean_acc:.3f} ± {std_acc:.3f}")
+    print(f"  vs frozen best:   63.7% (entropy SVM RBF)")
+    print(f"{'='*60}")
+
+    results = {
+        "model": "DINOv2 ViT-B/14 (last 2 blocks unfrozen)",
+        "image_size": 518,
+        "n_autograph": n_auto,
+        "n_circle": n_circle,
+        "lr": lr,
+        "weight_decay": weight_decay,
+        "epochs_max": epochs,
+        "patience": patience,
+        "batch_size": batch_size,
+        "cv_folds": 5,
+        "fold_results": fold_results,
+        "mean_bal_acc": round(float(mean_acc), 4),
+        "std_bal_acc": round(float(std_acc), 4),
+    }
+    with open(RESULTS_FINETUNE_JSON, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"\n  Saved → {RESULTS_FINETUNE_JSON}")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1791,6 +2012,10 @@ def main():
                         help="Option D: entropy-weighted tile aggregation")
     parser.add_argument("--probe", action="store_true",
                         help="Option F: linear probe on frozen embeddings (autograph vs circle)")
+    parser.add_argument("--concat", action="store_true",
+                        help="Option K: concatenate ViT-B + ViT-L + entropy embeddings for probe")
+    parser.add_argument("--finetune", action="store_true",
+                        help="Option I: fine-tune DINOv2 last 2 blocks on autograph vs circle")
     parser.add_argument("--refetch", action="store_true",
                         help="Delete cached inventory + embeddings to force re-fetch from all sources")
     args = parser.parse_args()
@@ -1819,6 +2044,49 @@ def main():
         for f in CACHE_META.glob("aic_*.json"):
             f.unlink()
         print("[Refetch] Cleared cached data — will re-fetch from all sources")
+
+    # --concat --probe: concatenate all three embedding sets, run probe, exit
+    if args.concat:
+        print("[Mode] Option K: concatenated embeddings (ViT-B + ViT-L + entropy)")
+        needed = {
+            "ViT-B": EMBEDDINGS_NPZ,
+            "ViT-L": EMBEDDINGS_VITL_NPZ,
+            "entropy": EMBEDDINGS_ENTROPY_NPZ,
+        }
+        for label, path in needed.items():
+            if not path.exists():
+                print(f"ERROR: No cached {label} embeddings at {path}. Run that pipeline first.")
+                sys.exit(1)
+        if not INVENTORY_CSV.exists():
+            print("ERROR: No cached inventory.")
+            sys.exit(1)
+        with open(INVENTORY_CSV) as f:
+            rows = list(csv.DictReader(f))
+
+        parts = []
+        for label, path in needed.items():
+            data = np.load(path, allow_pickle=True)
+            emb = np.concatenate([data["cls_embeddings"], data["patch_embeddings"]], axis=1)
+            print(f"  {label}: {emb.shape[1]}d")
+            parts.append(emb)
+        # Use painting_ids/artist_groups from ViT-B (all should match)
+        data0 = np.load(EMBEDDINGS_NPZ, allow_pickle=True)
+        painting_ids = data0["painting_ids"]
+        artist_groups = data0["artist_groups"]
+        full_embeddings = np.concatenate(parts, axis=1)
+        print(f"  Concatenated: {full_embeddings.shape[1]}d ({full_embeddings.shape[0]} paintings)")
+        stage4b_probe(full_embeddings, artist_groups, painting_ids, rows)
+        return
+
+    # --finetune: load inventory, fine-tune DINOv2, exit
+    if args.finetune:
+        if not INVENTORY_CSV.exists():
+            print("ERROR: No cached inventory. Run full pipeline first.")
+            sys.exit(1)
+        with open(INVENTORY_CSV) as f:
+            rows = list(csv.DictReader(f))
+        stage_finetune(rows)
+        return
 
     # --probe: load cached embeddings, run probe, exit
     if probe:

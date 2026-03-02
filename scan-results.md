@@ -221,6 +221,7 @@ This eliminates classifier capacity as a variable. The 72.3% ceiling is a featur
 | G: Wikidata expansion (N=711) | 59.0% balanced acc, perm p=0.003 | Data confirmed signal but frozen features plateau at ~59% |
 | C re-run (ViT-L, N=711) | 59.5% bal acc, lost "other Dutch" (p=0.249) | Model capacity still not the bottleneck |
 | D re-run (entropy, N=711) | **63.7% bal acc** — best probe config | Entropy helps supervised but destroys unsupervised pupil/other |
+| K: Concat (B+L+entropy, 5120d) | 62.3% bal acc (Logistic, p=0.001) | Concatenation diluted entropy signal. PCA 20 from 5120d too aggressive. |
 
 ## Next Steps
 
