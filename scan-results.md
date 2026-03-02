@@ -249,6 +249,32 @@ Recommendation: K first (quick win, almost free), then I (step change). E and J 
 
 If pushing the technical frontier, **O** (hybrid features) is where the real alpha is. Attribution is a multimodal problem — provenance, not pixels, is where authentication actually happens.
 
+### Tier 3: Multi-artist transfer learning (if Rembrandt-only data is exhausted)
+
+The fundamental bottleneck may not be Rembrandt data — it may be that "autograph vs workshop" is a general skill the model needs to learn across many masters before specializing. Wikidata's P1774–P1780 qualifiers apply to all artists. The SPARQL infrastructure from Option G works by swapping the artist QID.
+
+**Candidate artists for workshop data:**
+
+| Artist | QID | Why useful | Est. workshop paintings |
+|--------|-----|-----------|------------------------|
+| Rubens | Q5599 | Largest documented workshop in art history, well-catalogued | 200+ |
+| Cranach | Q191748 | Factory-scale production, many copies | 100+ |
+| Titian | Q47551 | Long career, significant late-period workshop | 50–100 |
+| Raphael | Q5597 | Workshop continued production after death | 50+ |
+| Van Dyck | Q150679 | Was in Rubens' workshop, then ran his own | 50+ |
+
+**Est. yield:** 2000–3000+ autograph-vs-workshop paintings across all artists.
+
+**Training strategies (in order of promise):**
+
+1. **Pre-train multi-artist → fine-tune Rembrandt.** Learn general "autograph vs workshop" features (brushwork confidence, color mixing, detail handling) from the full corpus. Fine-tune last layer on Rembrandt-only data. Directly addresses the overfitting problem — the model learns generalizable features before seeing Rembrandt.
+
+2. **Multi-task learning.** Predict "which artist" and "autograph vs workshop" simultaneously. Forces the model to disentangle artist identity from execution quality — exactly the separation we need.
+
+3. **Pooled binary classifier.** Train on all artists together as a single autograph-vs-workshop task. Works if "workshop-ness" is a universal visual property (hesitant brushwork, simplified detail) regardless of which master's style is being imitated.
+
+**Why this could be a step change:** Fold 1 of Option I fine-tuning memorized 568 Rembrandt paintings by epoch 10 (loss → 0.0005) but val accuracy peaked at 64.3% — classic overfitting. With 3000+ multi-artist paintings for pre-training, the model learns what "workshop execution" looks like in general before attempting the harder Rembrandt-specific question.
+
 ## v1-G: Wikidata SPARQL dataset expansion (1311 paintings)
 
 **Config:** Same as v1 (2000px, ViT-B/14, mean-only 1536d). Dataset expanded via Wikidata SPARQL queries using P170 (creator) with qualifier properties P1774–P1780 (workshop/follower/circle/manner/school). Sources: Wikidata Commons images at 2000px thumbnails. Museum APIs (NGA, CMA, AIC) returned 0 results — Wikidata alone was sufficient.
