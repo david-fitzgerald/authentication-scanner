@@ -40,6 +40,7 @@ CACHE_EMB = CACHE_DIR / "embeddings"
 CACHE_PLOTS = CACHE_DIR / "plots"
 
 INVENTORY_CSV = CACHE_META / "inventory.csv"
+INVENTORY_TRANSFER_CSV = CACHE_META / "inventory_transfer.csv"
 EMBEDDINGS_NPZ = CACHE_EMB / "embeddings.npz"
 EMBEDDINGS_V2_NPZ = CACHE_EMB / "embeddings_v2.npz"
 EMBEDDINGS_VITL_NPZ = CACHE_EMB / "embeddings_vitl.npz"
@@ -51,6 +52,11 @@ EMBEDDINGS_ENTROPY_VITL_NPZ = CACHE_EMB / "embeddings_entropy_vitl.npz"
 RESULTS_ENTROPY_JSON = CACHE_DIR / "results_entropy.json"
 RESULTS_ENTROPY_VITL_JSON = CACHE_DIR / "results_entropy_vitl.json"
 RESULTS_PROBE_JSON = CACHE_DIR / "results_probe.json"
+EMBEDDINGS_TRANSFER_NPZ = CACHE_EMB / "embeddings_transfer.npz"
+RESULTS_TRANSFER_JSON = CACHE_DIR / "results_transfer.json"
+RESULTS_LORA_JSON = CACHE_DIR / "results_lora.json"
+RESULTS_LORA_TRANSFER_JSON = CACHE_DIR / "results_lora_transfer.json"
+RESULTS_LORA_CURRICULUM_JSON = CACHE_DIR / "results_lora_curriculum.json"
 
 TILE_SIZE = 224
 IMG_MAX_PX = 2000        # v1 low-res cap
@@ -79,6 +85,15 @@ WD_CONTROL_ARTISTS = {
     "Jan Lievens": ("Q430783", "rembrandt_pupil"),
     "Frans Hals": ("Q167654", "dutch_other"),
     "Johannes Vermeer": ("Q41264", "dutch_other"),
+}
+# Transfer learning artists: name → (QID, short_label)
+WD_TRANSFER_ARTISTS = {
+    "Rubens": ("Q5599", "rubens"),
+    "Cranach": ("Q191748", "cranach"),
+    "Van Dyck": ("Q150679", "vandyck"),
+    "Titian": ("Q47551", "titian"),
+    "Frans Hals": ("Q167654", "hals"),
+    "Rembrandt": ("Q5598", "rembrandt"),
 }
 # P1774=workshop, P1775=follower, P1776=circle, P1777=manner, P1780=school
 WD_CIRCLE_QUALIFIERS = ["P1774", "P1775", "P1776", "P1777", "P1780"]
@@ -393,40 +408,38 @@ def wd_image_url(commons_url, width=2000):
     return f"https://upload.wikimedia.org/wikipedia/commons/thumb/{md5[0]}/{md5[:2]}/{encoded}/{thumb_name}"
 
 
-def wd_fetch_circle_paintings():
-    """Fetch circle/workshop/follower/manner/school Rembrandt paintings from Wikidata."""
+def wd_fetch_artist_circle(qid, artist_name="artist"):
+    """Fetch circle/workshop/follower/manner/school paintings for any artist from Wikidata."""
     query = f"""SELECT ?painting ?paintingLabel ?image ?qualLabel WHERE {{
   ?painting p:P170 ?stmt .
   ?painting wdt:P31 wd:Q3305213 .
   ?painting wdt:P18 ?image .
   {{
-    ?stmt pq:P1774 wd:{WD_REMBRANDT} . BIND("workshop" AS ?qualLabel)
+    ?stmt pq:P1774 wd:{qid} . BIND("workshop" AS ?qualLabel)
   }} UNION {{
-    ?stmt pq:P1775 wd:{WD_REMBRANDT} . BIND("follower" AS ?qualLabel)
+    ?stmt pq:P1775 wd:{qid} . BIND("follower" AS ?qualLabel)
   }} UNION {{
-    ?stmt pq:P1776 wd:{WD_REMBRANDT} . BIND("circle" AS ?qualLabel)
+    ?stmt pq:P1776 wd:{qid} . BIND("circle" AS ?qualLabel)
   }} UNION {{
-    ?stmt pq:P1777 wd:{WD_REMBRANDT} . BIND("manner" AS ?qualLabel)
+    ?stmt pq:P1777 wd:{qid} . BIND("manner" AS ?qualLabel)
   }} UNION {{
-    ?stmt pq:P1780 wd:{WD_REMBRANDT} . BIND("school" AS ?qualLabel)
+    ?stmt pq:P1780 wd:{qid} . BIND("school" AS ?qualLabel)
   }}
   SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en" }}
 }}"""
     bindings = wd_sparql(query)
-    # Deduplicate by QID (UNION can produce duplicate rows)
     seen = set()
     results = []
+    attrib_map = {"workshop": "workshop", "follower": "style",
+                  "circle": "circle", "manner": "style", "school": "school"}
     for b in bindings:
-        qid = b["painting"]["value"].split("/")[-1]
-        if qid in seen:
+        painting_qid = b["painting"]["value"].split("/")[-1]
+        if painting_qid in seen:
             continue
-        seen.add(qid)
+        seen.add(painting_qid)
         qual = b.get("qualLabel", {}).get("value", "circle")
-        # Map Wikidata qualifier to our attribution levels
-        attrib_map = {"workshop": "workshop", "follower": "style",
-                      "circle": "circle", "manner": "style", "school": "school"}
         results.append({
-            "qid": qid,
+            "qid": painting_qid,
             "title": b.get("paintingLabel", {}).get("value", ""),
             "image": b.get("image", {}).get("value", ""),
             "attribution": attrib_map.get(qual, "circle"),
@@ -435,17 +448,17 @@ def wd_fetch_circle_paintings():
     return results
 
 
-def wd_fetch_autograph_paintings():
-    """Fetch autograph Rembrandt paintings from Wikidata (direct P170, no qualifier)."""
+def wd_fetch_artist_autographs(qid, artist_name="artist"):
+    """Fetch autograph paintings for any artist from Wikidata (direct P170, no qualifier)."""
     query = f"""SELECT ?painting ?paintingLabel ?image WHERE {{
-  ?painting wdt:P170 wd:{WD_REMBRANDT} .
+  ?painting wdt:P170 wd:{qid} .
   ?painting wdt:P31 wd:Q3305213 .
   ?painting wdt:P18 ?image .
   FILTER NOT EXISTS {{
     ?painting p:P170 ?stmt .
-    {{ ?stmt pq:P1774 wd:{WD_REMBRANDT} }} UNION {{ ?stmt pq:P1775 wd:{WD_REMBRANDT} }}
-    UNION {{ ?stmt pq:P1776 wd:{WD_REMBRANDT} }} UNION {{ ?stmt pq:P1777 wd:{WD_REMBRANDT} }}
-    UNION {{ ?stmt pq:P1780 wd:{WD_REMBRANDT} }}
+    {{ ?stmt pq:P1774 wd:{qid} }} UNION {{ ?stmt pq:P1775 wd:{qid} }}
+    UNION {{ ?stmt pq:P1776 wd:{qid} }} UNION {{ ?stmt pq:P1777 wd:{qid} }}
+    UNION {{ ?stmt pq:P1780 wd:{qid} }}
   }}
   SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en" }}
 }}"""
@@ -453,16 +466,26 @@ def wd_fetch_autograph_paintings():
     seen = set()
     results = []
     for b in bindings:
-        qid = b["painting"]["value"].split("/")[-1]
-        if qid in seen:
+        painting_qid = b["painting"]["value"].split("/")[-1]
+        if painting_qid in seen:
             continue
-        seen.add(qid)
+        seen.add(painting_qid)
         results.append({
-            "qid": qid,
+            "qid": painting_qid,
             "title": b.get("paintingLabel", {}).get("value", ""),
             "image": b.get("image", {}).get("value", ""),
         })
     return results
+
+
+def wd_fetch_circle_paintings():
+    """Fetch circle/workshop Rembrandt paintings. Backward-compat wrapper."""
+    return wd_fetch_artist_circle(WD_REMBRANDT, "Rembrandt")
+
+
+def wd_fetch_autograph_paintings():
+    """Fetch autograph Rembrandt paintings. Backward-compat wrapper."""
+    return wd_fetch_artist_autographs(WD_REMBRANDT, "Rembrandt")
 
 
 def wd_fetch_control_paintings():
@@ -1009,6 +1032,100 @@ def _print_inventory_summary(rows):
 
 
 # ---------------------------------------------------------------------------
+# Stage 1T: Transfer Metadata (multi-artist)
+# ---------------------------------------------------------------------------
+
+def stage1_transfer_metadata():
+    """Fetch painting inventory for all transfer artists from Wikidata."""
+    if INVENTORY_TRANSFER_CSV.exists():
+        rows = []
+        with open(INVENTORY_TRANSFER_CSV) as f:
+            rows = list(csv.DictReader(f))
+        print(f"[Stage 1T] Loaded cached transfer inventory: {len(rows)} paintings")
+        return rows
+
+    CACHE_META.mkdir(parents=True, exist_ok=True)
+    rows = []
+    seen_qids = set()
+
+    for artist_name, (qid, label) in WD_TRANSFER_ARTISTS.items():
+        print(f"\n[Stage 1T] Fetching {artist_name} (QID={qid})...")
+
+        # Autograph paintings
+        auto = wd_fetch_artist_autographs(qid, artist_name)
+        auto_added = 0
+        for p in auto:
+            if p["qid"] in seen_qids:
+                continue
+            seen_qids.add(p["qid"])
+            image_url = wd_image_url(p["image"])
+            row = {
+                "obj_id": f"wd_{p['qid']}",
+                "source": "wikidata",
+                "title": p["title"],
+                "creator": artist_name,
+                "date": "",
+                "image_url": image_url,
+                "artist_group": f"{label}_autograph",
+                "attribution": "autograph",
+                "artist": label,
+            }
+            rows.append(row)
+            auto_added += 1
+        print(f"  Autograph: {auto_added} paintings")
+
+        # Circle/workshop paintings
+        circle = wd_fetch_artist_circle(qid, artist_name)
+        circle_added = 0
+        for p in circle:
+            if p["qid"] in seen_qids:
+                continue
+            seen_qids.add(p["qid"])
+            image_url = wd_image_url(p["image"])
+            row = {
+                "obj_id": f"wd_{p['qid']}",
+                "source": "wikidata",
+                "title": p["title"],
+                "creator": f"{p['wd_qualifier']} of {artist_name}",
+                "date": "",
+                "image_url": image_url,
+                "artist_group": f"{label}_circle",
+                "attribution": p["attribution"],
+                "artist": label,
+            }
+            rows.append(row)
+            circle_added += 1
+        print(f"  Circle/workshop: {circle_added} paintings")
+
+    # Save
+    fieldnames = ["obj_id", "source", "title", "creator", "date", "image_url",
+                   "artist_group", "attribution", "artist"]
+    with open(INVENTORY_TRANSFER_CSV, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"\n[Stage 1T] Saved {len(rows)} paintings to {INVENTORY_TRANSFER_CSV}")
+    _print_transfer_summary(rows)
+    return rows
+
+
+def _print_transfer_summary(rows):
+    """Print transfer inventory breakdown by artist."""
+    from collections import Counter
+    artists = Counter(r["artist"] for r in rows)
+    print(f"\n  By artist:")
+    for artist in sorted(artists):
+        artist_rows = [r for r in rows if r["artist"] == artist]
+        n_auto = sum(1 for r in artist_rows if r["artist_group"].endswith("_autograph"))
+        n_circle = sum(1 for r in artist_rows if r["artist_group"].endswith("_circle"))
+        print(f"    {artist:12s}: {n_auto:5d} autograph, {n_circle:4d} circle/workshop = {len(artist_rows):5d} total")
+    total_auto = sum(1 for r in rows if r["artist_group"].endswith("_autograph"))
+    total_circle = sum(1 for r in rows if r["artist_group"].endswith("_circle"))
+    print(f"    {'TOTAL':12s}: {total_auto:5d} autograph, {total_circle:4d} circle/workshop = {len(rows):5d} total")
+
+
+# ---------------------------------------------------------------------------
 # Stage 2: Download Images
 # ---------------------------------------------------------------------------
 
@@ -1095,16 +1212,19 @@ def _tile_batches(img, tile_size, batch_size, transform):
         yield torch.stack(batch)
 
 
-def stage3_embed(rows, hires=False, model_name="vitb14", entropy=False):
+def stage3_embed(rows, hires=False, model_name="vitb14", entropy=False, emb_file_override=None):
     """Tile images and embed with DINOv2.
 
     v1 (hires=False): mean-only aggregation. Cache: embeddings.npz
     v2 (hires=True):  mean+std aggregation. Cache: embeddings_v2.npz
     vitl14:           ViT-L model (1024d vs 768d). Cache: embeddings_vitl.npz
     entropy:          entropy-weighted tile aggregation. Cache: embeddings_entropy[_vitl].npz
+    emb_file_override: override cache file path (for transfer corpus)
     """
     CACHE_EMB.mkdir(parents=True, exist_ok=True)
-    if entropy:
+    if emb_file_override:
+        cache_file = emb_file_override
+    elif entropy:
         cache_file = EMBEDDINGS_ENTROPY_VITL_NPZ if model_name == "vitl14" else EMBEDDINGS_ENTROPY_NPZ
     elif model_name == "vitl14":
         cache_file = EMBEDDINGS_VITL_NPZ
@@ -1157,6 +1277,7 @@ def stage3_embed(rows, hires=False, model_name="vitb14", entropy=False):
     patch_std_list = []
     groups_list = []
     attribs_list = []
+    artists_list = []
     skipped = 0
 
     chunk_starts = list(range(0, len(rows), CHUNK_SIZE))
@@ -1234,6 +1355,7 @@ def stage3_embed(rows, hires=False, model_name="vitb14", entropy=False):
 
             groups_list.append(row["artist_group"])
             attribs_list.append(row["attribution"])
+            artists_list.append(row.get("artist", ""))
 
             if hires and (len(painting_ids) % 10 == 0 or len(painting_ids) == 1):
                 print(f"      {row['obj_id']}: {img.size[0]}x{img.size[1]}, {n_tiles} tiles")
@@ -1245,6 +1367,7 @@ def stage3_embed(rows, hires=False, model_name="vitb14", entropy=False):
     painting_ids = np.array(painting_ids)
     artist_groups = np.array(groups_list)
     attributions = np.array(attribs_list)
+    artists = np.array(artists_list)
 
     if hires:
         cls_mean = np.array(cls_mean_list)
@@ -1255,7 +1378,8 @@ def stage3_embed(rows, hires=False, model_name="vitb14", entropy=False):
                  painting_ids=painting_ids,
                  cls_mean=cls_mean, cls_std=cls_std,
                  patch_mean=patch_mean, patch_std=patch_std,
-                 artist_groups=artist_groups, attributions=attributions)
+                 artist_groups=artist_groups, attributions=attributions,
+                 artists=artists)
         print(f"[Stage 3] Saved {len(painting_ids)} embeddings ({cls_mean.shape[1]*4}d) to {cache_file}")
         del model
         return painting_ids, cls_mean, cls_std, patch_mean, patch_std, artist_groups, attributions
@@ -1266,7 +1390,8 @@ def stage3_embed(rows, hires=False, model_name="vitb14", entropy=False):
                  painting_ids=painting_ids,
                  cls_embeddings=cls_embeddings,
                  patch_embeddings=patch_embeddings,
-                 artist_groups=artist_groups, attributions=attributions)
+                 artist_groups=artist_groups, attributions=attributions,
+                 artists=artists)
         print(f"[Stage 3] Saved {len(painting_ids)} embeddings to {cache_file}")
         del model
         return painting_ids, cls_embeddings, patch_embeddings, artist_groups, attributions
@@ -2377,11 +2502,22 @@ def main():
                         help="Option J: CLIP ViT-L/14 features for probe")
     parser.add_argument("--refetch", action="store_true",
                         help="Delete cached inventory + embeddings to force re-fetch from all sources")
+    parser.add_argument("--corpus", choices=["rembrandt", "transfer"], default="rembrandt",
+                        help="Corpus: rembrandt (default) or transfer (multi-artist)")
+    parser.add_argument("--lora", action="store_true",
+                        help="Experiment B: LoRA fine-tune DINOv2 on autograph vs circle")
+    parser.add_argument("--transfer-probe", action="store_true",
+                        help="Experiment A: frozen probe on transfer corpus")
+    parser.add_argument("--lora-transfer", action="store_true",
+                        help="Experiment C: LoRA leave-artist-out on transfer corpus")
+    parser.add_argument("--lora-curriculum", action="store_true",
+                        help="Experiment D: LoRA pre-train on 5 artists, fine-tune on Rembrandt")
     args = parser.parse_args()
     hires = args.hires
     model_name = args.model
     entropy = args.entropy
     probe = args.probe
+    corpus = args.corpus
 
     for d in [CACHE_META, CACHE_IMG, CACHE_IMG_HIRES, CACHE_EMB, CACHE_PLOTS]:
         d.mkdir(parents=True, exist_ok=True)
@@ -2467,6 +2603,54 @@ def main():
         stage_clip(rows)
         return
 
+    # --lora: LoRA fine-tune on Rembrandt (Experiment B)
+    if args.lora:
+        if not INVENTORY_CSV.exists():
+            print("ERROR: No cached inventory. Run full pipeline first.")
+            sys.exit(1)
+        with open(INVENTORY_CSV) as f:
+            rows = list(csv.DictReader(f))
+        stage_lora(rows)
+        return
+
+    # --transfer-probe: frozen probe on transfer corpus (Experiment A)
+    if args.transfer_probe:
+        if not INVENTORY_TRANSFER_CSV.exists():
+            print("ERROR: No transfer inventory. Run --corpus transfer --stage 1 first.")
+            sys.exit(1)
+        if not EMBEDDINGS_TRANSFER_NPZ.exists():
+            print("ERROR: No transfer embeddings. Run --corpus transfer first.")
+            sys.exit(1)
+        with open(INVENTORY_TRANSFER_CSV) as f:
+            rows = list(csv.DictReader(f))
+        stage_transfer_probe(rows)
+        return
+
+    # --lora-transfer: LoRA leave-artist-out (Experiment C)
+    if args.lora_transfer:
+        if not INVENTORY_TRANSFER_CSV.exists():
+            print("ERROR: No transfer inventory. Run --corpus transfer --stage 1 first.")
+            sys.exit(1)
+        with open(INVENTORY_TRANSFER_CSV) as f:
+            rows = list(csv.DictReader(f))
+        stage_lora_transfer(rows)
+        return
+
+    # --lora-curriculum: Two-phase transfer (Experiment D)
+    if args.lora_curriculum:
+        if not INVENTORY_TRANSFER_CSV.exists():
+            print("ERROR: No transfer inventory. Run --corpus transfer --stage 1 first.")
+            sys.exit(1)
+        if not INVENTORY_CSV.exists():
+            print("ERROR: No Rembrandt inventory. Run full pipeline first.")
+            sys.exit(1)
+        with open(INVENTORY_TRANSFER_CSV) as f:
+            transfer_rows = list(csv.DictReader(f))
+        with open(INVENTORY_CSV) as f:
+            rembrandt_rows = list(csv.DictReader(f))
+        stage_lora_curriculum(transfer_rows, rembrandt_rows)
+        return
+
     # --probe: load cached embeddings, run probe, exit
     if probe:
         if entropy and model_name == "vitl14":
@@ -2501,6 +2685,35 @@ def main():
 
     start_stage = args.stage or 1
     end_stage = args.stage or 5
+
+    # Transfer corpus: simplified pipeline (stages 1-3 only, entropy mode)
+    if corpus == "transfer":
+        print("[Mode] Transfer corpus — multi-artist Wikidata pipeline")
+        inv_csv = INVENTORY_TRANSFER_CSV
+        emb_file = EMBEDDINGS_TRANSFER_NPZ
+
+        if start_stage <= 1:
+            rows = stage1_transfer_metadata()
+        else:
+            if not inv_csv.exists():
+                print("ERROR: No transfer inventory. Run --corpus transfer --stage 1 first.")
+                sys.exit(1)
+            with open(inv_csv) as f:
+                rows = list(csv.DictReader(f))
+            print(f"[Stage 1T] Loaded {len(rows)} paintings from cache")
+
+        if end_stage < 2:
+            return
+
+        if start_stage <= 2:
+            stage2_images(rows)
+
+        if end_stage < 3:
+            return
+
+        if start_stage <= 3:
+            stage3_embed(rows, entropy=True, emb_file_override=emb_file)
+        return
 
     model_label = "ViT-L/14" if model_name == "vitl14" else "ViT-B/14"
     if entropy:
