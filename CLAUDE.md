@@ -1,8 +1,8 @@
 ---
-version: 0.2.0
+version: 0.3.0
 status: building
 harness: L0
-updated: 2026-03-01
+updated: 2026-03-03
 ---
 
 # Authentication â€” Claude Instructions
@@ -18,6 +18,12 @@ AI-driven art authentication via DINOv2 embeddings. Collection-scale screening â
 | High-res mode (v2) | `python scan.py --hires` |
 | ViT-L/14 model | `python scan.py --model vitl14` |
 | Re-fetch all data | `python scan.py --refetch` |
+| Transfer corpus (fetch+embed) | `python scan.py --corpus transfer` |
+| Transfer corpus (stage 1 only) | `python scan.py --corpus transfer --stage 1` |
+| Exp A: Frozen transfer probe | `python scan.py --transfer-probe` |
+| Exp B: LoRA Rembrandt-only | `python scan.py --lora` |
+| Exp C: LoRA leave-artist-out | `python scan.py --lora-transfer` |
+| Exp D: Two-phase curriculum | `python scan.py --lora-curriculum` |
 
 ## Environment
 
@@ -40,7 +46,7 @@ AI-driven art authentication via DINOv2 embeddings. Collection-scale screening â
 
 ## Status
 
-**Best result: 63.7% balanced accuracy (entropy SVM RBF, frozen features).** All Tier 1 options exhausted (I/E/J/K/C/D). None breaks 64%. Frozen-feature ceiling confirmed. Next: Tier 2 (diagnostic regions, metadata hybrid) or Tier 3 (multi-artist transfer learning) or pivot to "wrong artist" detector (Option N).
+**Best result: 63.7% balanced accuracy (entropy SVM RBF, frozen features).** All Tier 1 options exhausted. Tier 3 (multi-artist transfer + LoRA) implemented â€” 4 experiments ready to run. Transfer corpus: 6 artists, ~6K paintings from Wikidata SPARQL. LoRA: ~148K trainable params (peft, rank=8, last 4 blocks).
 
 ## Decisions Log
 
@@ -64,6 +70,7 @@ AI-driven art authentication via DINOv2 embeddings. Collection-scale screening â
 | 2026-03-03 | E: Per-tile classification eliminated | 60.2% vote bal acc â€” tile labels too noisy, majority voting can't recover signal. |
 | 2026-03-03 | J: CLIP ViT-L/14 eliminated | 62.9% bal acc â€” different foundation model, similar result. Overlapping style info. |
 | 2026-03-03 | **Tier 1 exhausted** | All frozen-feature options (C/D/E/I/J/K) converge at ~59â€“64%. Ceiling is 63.7% (entropy SVM RBF). |
+| 2026-03-03 | Tier 3: Multi-artist transfer + LoRA | 6 artists (Rubens, Cranach, Van Dyck, Titian, Hals, Rembrandt). 4 experiments: A (frozen probe), B (LoRA Rembrandt), C (LoRA leave-artist-out), D (curriculum transfer). peft installed. |
 
 ## Conventions
 
