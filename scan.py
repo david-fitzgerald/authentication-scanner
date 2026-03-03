@@ -2477,6 +2477,863 @@ def stage_clip(rows):
 
 
 # ---------------------------------------------------------------------------
+# Experiment A: Pooled frozen probe on transfer corpus
+# ---------------------------------------------------------------------------
+
+def stage_transfer_probe(rows):
+    """Frozen-feature probe on multi-artist transfer corpus.
+
+    A1: Pooled 10-fold (all 6 artists, binary autograph vs circle)
+    A2: Leave-artist-out — train on 5, test on 1, repeat 6x
+    """
+    from sklearn.decomposition import PCA
+    from sklearn.svm import SVC
+    from sklearn.model_selection import StratifiedKFold, cross_val_score
+    from sklearn.metrics import balanced_accuracy_score
+
+    if not EMBEDDINGS_TRANSFER_NPZ.exists():
+        print("ERROR: No transfer embeddings. Run --corpus transfer first.")
+        sys.exit(1)
+
+    data = np.load(EMBEDDINGS_TRANSFER_NPZ, allow_pickle=True)
+    painting_ids = data["painting_ids"]
+    cls_emb = data["cls_embeddings"]
+    patch_emb = data["patch_embeddings"]
+    artist_groups = data["artist_groups"]
+    artists = data["artists"]
+    full_emb = np.concatenate([cls_emb, patch_emb], axis=1)
+
+    # Binary label: autograph=1, circle=0
+    y = np.array([1 if g.endswith("_autograph") else 0 for g in artist_groups])
+    n = len(y)
+    n_auto = int(y.sum())
+    n_circle = n - n_auto
+    unique_artists = sorted(set(artists))
+
+    print(f"\n[Exp A] Transfer probe: {n_auto} autograph + {n_circle} circle = {n} paintings")
+    print(f"  Artists: {', '.join(unique_artists)}")
+    print(f"  Features: {full_emb.shape[1]}d")
+
+    # --- A1: Pooled 10-fold ---
+    print(f"\n  === A1: Pooled 10-fold (all artists) ===")
+    pca_dims = [10, 20]
+    C_values = [0.01, 0.1, 1.0, 10.0]
+    skf = StratifiedKFold(n_splits=10, shuffle=True, random_state=42)
+
+    best_acc, best_dims, best_C = 0, 0, 0
+    print(f"  {'PCA':<6} " + " ".join(f"C={v:<6}" for v in C_values))
+    for dims in pca_dims:
+        pca = PCA(n_components=dims, random_state=42)
+        X_pca = pca.fit_transform(full_emb)
+        row_str = f"  {dims:<6}"
+        for C in C_values:
+            clf = SVC(C=C, kernel="rbf", gamma="scale", class_weight="balanced")
+            scores = cross_val_score(clf, X_pca, y, cv=skf, scoring="balanced_accuracy")
+            acc = scores.mean()
+            row_str += f" {acc:<8.3f}"
+            if acc > best_acc:
+                best_acc, best_dims, best_C = acc, dims, C
+        print(row_str)
+    print(f"  A1 best: PCA={best_dims}, C={best_C} → {best_acc:.3f} balanced accuracy")
+
+    # --- A2: Leave-artist-out ---
+    print(f"\n  === A2: Leave-artist-out (train 5, test 1) ===")
+    a2_results = []
+    for test_artist in unique_artists:
+        test_mask = artists == test_artist
+        train_mask = ~test_mask
+        n_test = int(test_mask.sum())
+        n_test_auto = int((y[test_mask] == 1).sum())
+        n_test_circle = n_test - n_test_auto
+
+        if n_test_auto == 0 or n_test_circle == 0:
+            print(f"    {test_artist:12s}: SKIP (only one class in test set)")
+            a2_results.append({"artist": test_artist, "bal_acc": None, "n": n_test})
+            continue
+
+        pca = PCA(n_components=best_dims, random_state=42)
+        X_train = pca.fit_transform(full_emb[train_mask])
+        X_test = pca.transform(full_emb[test_mask])
+        clf = SVC(C=best_C, kernel="rbf", gamma="scale", class_weight="balanced")
+        clf.fit(X_train, y[train_mask])
+        preds = clf.predict(X_test)
+        bal_acc = balanced_accuracy_score(y[test_mask], preds)
+        print(f"    {test_artist:12s}: {bal_acc:.3f} ({n_test_auto} auto + {n_test_circle} circle = {n_test})")
+        a2_results.append({"artist": test_artist, "bal_acc": round(bal_acc, 4),
+                           "n": n_test, "n_auto": n_test_auto, "n_circle": n_test_circle})
+
+    # Summary
+    valid = [r for r in a2_results if r["bal_acc"] is not None]
+    mean_a2 = np.mean([r["bal_acc"] for r in valid])
+    rembrandt_a2 = next((r["bal_acc"] for r in a2_results if r["artist"] == "rembrandt"), None)
+
+    print(f"\n{'='*60}")
+    print(f"  EXPERIMENT A RESULTS")
+    print(f"{'='*60}")
+    print(f"  A1 pooled 10-fold:       {best_acc:.3f}")
+    print(f"  A2 leave-artist-out mean: {mean_a2:.3f}")
+    print(f"  A2 Rembrandt (zero-shot): {rembrandt_a2:.3f}" if rembrandt_a2 else "  A2 Rembrandt: N/A")
+    print(f"  Cross-artist signal:     {'YES (>55%)' if rembrandt_a2 and rembrandt_a2 > 0.55 else 'WEAK/NO'}")
+    print(f"{'='*60}")
+
+    results = {
+        "a1_pooled_bal_acc": round(best_acc, 4),
+        "a1_best_pca": best_dims,
+        "a1_best_C": best_C,
+        "a2_leave_artist_out": a2_results,
+        "a2_mean": round(mean_a2, 4),
+        "a2_rembrandt": rembrandt_a2,
+        "n_total": n,
+        "n_autograph": n_auto,
+        "n_circle": n_circle,
+    }
+    with open(RESULTS_TRANSFER_JSON, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"  Saved → {RESULTS_TRANSFER_JSON}")
+
+
+# ---------------------------------------------------------------------------
+# Experiment B: LoRA Rembrandt-only
+# ---------------------------------------------------------------------------
+
+def _build_lora_model(rank=8, alpha=16, dropout=0.1):
+    """Build DINOv2 ViT-B/14 with LoRA adapters on last 4 attention blocks.
+
+    Returns (model, n_trainable_params).
+    Falls back to manual LoRA if peft is not available.
+    """
+    import torch
+    import torch.nn as nn
+
+    backbone = torch.hub.load("facebookresearch/dinov2", "dinov2_vitb14", pretrained=True)
+    for param in backbone.parameters():
+        param.requires_grad = False
+
+    try:
+        from peft import LoraConfig, get_peft_model
+        # Apply LoRA to last 4 blocks' attention qkv and projection
+        target_modules = []
+        n_blocks = len(backbone.blocks)
+        for i in range(n_blocks - 4, n_blocks):
+            target_modules.extend([
+                f"blocks.{i}.attn.qkv",
+                f"blocks.{i}.attn.proj",
+            ])
+        config = LoraConfig(
+            r=rank,
+            lora_alpha=alpha,
+            lora_dropout=dropout,
+            target_modules=target_modules,
+            bias="none",
+        )
+        backbone = get_peft_model(backbone, config)
+        trainable = sum(p.numel() for p in backbone.parameters() if p.requires_grad)
+        print(f"  LoRA via peft: {trainable:,} trainable params (rank={rank}, alpha={alpha})")
+    except ImportError:
+        print("  peft not available, using manual LoRA")
+        trainable = _apply_manual_lora(backbone, rank, alpha, dropout)
+
+    class LoRAModel(nn.Module):
+        def __init__(self, backbone):
+            super().__init__()
+            self.backbone = backbone
+            self.head = nn.Linear(768, 1)
+        def forward(self, x):
+            features = self.backbone(x)
+            if isinstance(features, dict):
+                features = features["x_norm_clstoken"]
+            return self.head(features).squeeze(-1)
+
+    model = LoRAModel(backbone)
+    # Head is trainable
+    trainable += sum(p.numel() for p in model.head.parameters())
+    return model, trainable
+
+
+def _apply_manual_lora(backbone, rank, alpha, dropout):
+    """Manual LoRA injection — fallback when peft is unavailable."""
+    import torch
+    import torch.nn as nn
+
+    class LoRALinear(nn.Module):
+        def __init__(self, original, rank, alpha, dropout):
+            super().__init__()
+            self.original = original
+            in_f = original.in_features
+            out_f = original.out_features
+            self.lora_A = nn.Parameter(torch.randn(in_f, rank) * 0.01)
+            self.lora_B = nn.Parameter(torch.zeros(rank, out_f))
+            self.scale = alpha / rank
+            self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
+        def forward(self, x):
+            base = self.original(x)
+            lora = self.dropout(x) @ self.lora_A @ self.lora_B * self.scale
+            return base + lora
+
+    trainable = 0
+    n_blocks = len(backbone.blocks)
+    for i in range(n_blocks - 4, n_blocks):
+        block = backbone.blocks[i]
+        # Replace qkv and proj with LoRA versions
+        block.attn.qkv = LoRALinear(block.attn.qkv, rank, alpha, dropout)
+        block.attn.proj = LoRALinear(block.attn.proj, rank, alpha, dropout)
+        trainable += sum(p.numel() for p in block.attn.qkv.parameters() if p.requires_grad)
+        trainable += sum(p.numel() for p in block.attn.proj.parameters() if p.requires_grad)
+
+    print(f"  Manual LoRA: {trainable:,} trainable params (rank={rank}, alpha={alpha})")
+    return trainable
+
+
+def stage_lora(rows, label="Rembrandt", results_file=None):
+    """LoRA fine-tune DINOv2 ViT-B/14 on autograph vs circle.
+
+    5-fold stratified CV, balanced class weights, early stopping.
+    Whole paintings resized to 518×518.
+    """
+    import torch
+    import torch.nn as nn
+    from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+    from torchvision import transforms
+    from sklearn.model_selection import StratifiedKFold
+    from sklearn.metrics import balanced_accuracy_score
+
+    if results_file is None:
+        results_file = RESULTS_LORA_JSON
+
+    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    print(f"\n[LoRA {label}] Device: {device}")
+
+    # Filter to autograph + circle
+    auto_circle = [(r, 1 if r["artist_group"].endswith("_autograph") else 0)
+                   for r in rows if r["artist_group"].endswith("_autograph") or r["artist_group"].endswith("_circle")]
+    print(f"[LoRA {label}] {sum(y for _, y in auto_circle)} autograph + "
+          f"{sum(1 - y for _, y in auto_circle)} circle = {len(auto_circle)} paintings")
+
+    # Resolve image paths
+    img_paths = []
+    labels = []
+    for r, y in auto_circle:
+        path = CACHE_IMG / f"{r['obj_id']}.jpg"
+        if path.exists():
+            img_paths.append(path)
+            labels.append(y)
+    labels = np.array(labels)
+    print(f"[LoRA {label}] {len(img_paths)} images found")
+
+    train_transform = transforms.Compose([
+        transforms.Resize((518, 518)),
+        transforms.RandomHorizontalFlip(p=0.3),
+        transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.05),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+    val_transform = transforms.Compose([
+        transforms.Resize((518, 518)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+
+    class PaintingDataset(Dataset):
+        def __init__(self, indices, transform):
+            self.indices = indices
+            self.transform = transform
+        def __len__(self):
+            return len(self.indices)
+        def __getitem__(self, idx):
+            i = self.indices[idx]
+            img = Image.open(img_paths[i]).convert("RGB")
+            return self.transform(img), labels[i]
+
+    # Hyperparameters
+    lr = 5e-5
+    weight_decay = 0.01
+    epochs = 50
+    patience = 10
+    batch_size = 4
+
+    n_auto = int(labels.sum())
+    n_circle = len(labels) - n_auto
+
+    # 5-fold stratified CV
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    fold_results = []
+
+    for fold, (train_idx, val_idx) in enumerate(skf.split(img_paths, labels)):
+        print(f"\n  --- Fold {fold + 1}/5 ---")
+        print(f"  Train: {sum(labels[train_idx])} auto + {sum(1 - labels[train_idx])} circle = {len(train_idx)}")
+        print(f"  Val:   {sum(labels[val_idx])} auto + {sum(1 - labels[val_idx])} circle = {len(val_idx)}")
+
+        train_ds = PaintingDataset(train_idx, train_transform)
+        val_ds = PaintingDataset(val_idx, val_transform)
+
+        train_labels = labels[train_idx]
+        class_counts = np.bincount(train_labels)
+        class_weights = 1.0 / class_counts
+        sample_weights = class_weights[train_labels]
+        sampler = WeightedRandomSampler(sample_weights, len(sample_weights), replacement=True)
+
+        train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=sampler, num_workers=0)
+        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
+
+        model, trainable = _build_lora_model()
+        if fold == 0:
+            print(f"  Trainable params: {trainable:,}")
+        model.to(device)
+        optimizer = torch.optim.AdamW(
+            [p for p in model.parameters() if p.requires_grad],
+            lr=lr, weight_decay=weight_decay
+        )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+        criterion = nn.BCEWithLogitsLoss()
+
+        best_val_bal_acc = 0
+        best_epoch = 0
+        no_improve = 0
+
+        for epoch in range(epochs):
+            model.train()
+            train_loss = 0
+            for X_batch, y_batch in train_loader:
+                X_batch = X_batch.to(device)
+                y_batch = y_batch.float().to(device)
+                optimizer.zero_grad()
+                logits = model(X_batch)
+                loss = criterion(logits, y_batch)
+                loss.backward()
+                optimizer.step()
+                train_loss += loss.item() * len(y_batch)
+            train_loss /= len(train_idx)
+            scheduler.step()
+
+            model.eval()
+            val_preds, val_true = [], []
+            with torch.no_grad():
+                for X_batch, y_batch in val_loader:
+                    X_batch = X_batch.to(device)
+                    logits = model(X_batch)
+                    preds = (logits > 0).long().cpu().numpy()
+                    val_preds.extend(preds)
+                    val_true.extend(y_batch.numpy())
+            val_bal_acc = balanced_accuracy_score(val_true, val_preds)
+
+            if (epoch + 1) % 5 == 0 or epoch == 0:
+                print(f"    Epoch {epoch + 1:2d}: loss={train_loss:.4f}, val_bal_acc={val_bal_acc:.3f}")
+
+            if val_bal_acc > best_val_bal_acc:
+                best_val_bal_acc = val_bal_acc
+                best_epoch = epoch + 1
+                no_improve = 0
+            else:
+                no_improve += 1
+                if no_improve >= patience:
+                    print(f"    Early stop at epoch {epoch + 1} (best: {best_val_bal_acc:.3f} at epoch {best_epoch})")
+                    break
+
+        print(f"  Fold {fold + 1} best: {best_val_bal_acc:.3f} (epoch {best_epoch})")
+        fold_results.append({
+            "fold": fold + 1,
+            "best_val_bal_acc": round(best_val_bal_acc, 4),
+            "best_epoch": best_epoch,
+        })
+        del model
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+
+    accs = [r["best_val_bal_acc"] for r in fold_results]
+    mean_acc = np.mean(accs)
+    std_acc = np.std(accs)
+
+    print(f"\n{'='*60}")
+    print(f"  LORA RESULTS ({label})")
+    print(f"{'='*60}")
+    print(f"  Model:            DINOv2 ViT-B/14 + LoRA (last 4 blocks)")
+    print(f"  Image size:       518×518")
+    print(f"  N autograph:      {n_auto}")
+    print(f"  N circle:         {n_circle}")
+    print(f"  CV:               5-fold stratified")
+    print(f"  Folds:            {', '.join(f'{a:.3f}' for a in accs)}")
+    print(f"  Mean bal acc:     {mean_acc:.3f} ± {std_acc:.3f}")
+    print(f"  vs frozen best:   63.7% (entropy SVM RBF)")
+    print(f"  vs fine-tune (I): 60.0% ± 5.0%")
+    print(f"{'='*60}")
+
+    results = {
+        "model": "DINOv2 ViT-B/14 + LoRA (last 4 blocks)",
+        "image_size": 518,
+        "n_autograph": n_auto,
+        "n_circle": n_circle,
+        "lr": lr,
+        "weight_decay": weight_decay,
+        "epochs_max": epochs,
+        "patience": patience,
+        "batch_size": batch_size,
+        "lora_rank": 8,
+        "lora_alpha": 16,
+        "cv_folds": 5,
+        "fold_results": fold_results,
+        "mean_bal_acc": round(float(mean_acc), 4),
+        "std_bal_acc": round(float(std_acc), 4),
+    }
+    with open(results_file, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"\n  Saved → {results_file}")
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Experiment C: LoRA leave-artist-out
+# ---------------------------------------------------------------------------
+
+def stage_lora_transfer(rows):
+    """LoRA leave-artist-out on transfer corpus.
+
+    C1: Pooled 10-fold (all artists mixed)
+    C2: Leave-artist-out — train on 5, test on 1, repeat 6x
+    """
+    import torch
+    import torch.nn as nn
+    from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+    from torchvision import transforms
+    from sklearn.model_selection import StratifiedKFold
+    from sklearn.metrics import balanced_accuracy_score
+
+    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    print(f"\n[Exp C] LoRA leave-artist-out. Device: {device}")
+
+    # Filter to autograph + circle, resolve images
+    ac_rows = [r for r in rows
+                if r["artist_group"].endswith("_autograph") or r["artist_group"].endswith("_circle")]
+    img_paths = []
+    labels = []
+    artists = []
+    for r in ac_rows:
+        path = CACHE_IMG / f"{r['obj_id']}.jpg"
+        if path.exists():
+            img_paths.append(path)
+            labels.append(1 if r["artist_group"].endswith("_autograph") else 0)
+            artists.append(r.get("artist", ""))
+    labels = np.array(labels)
+    artists = np.array(artists)
+    n = len(labels)
+    n_auto = int(labels.sum())
+    n_circle = n - n_auto
+    unique_artists = sorted(set(artists))
+    print(f"  {n_auto} autograph + {n_circle} circle = {n} paintings across {len(unique_artists)} artists")
+
+    train_transform = transforms.Compose([
+        transforms.Resize((518, 518)),
+        transforms.RandomHorizontalFlip(p=0.3),
+        transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.05),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+    val_transform = transforms.Compose([
+        transforms.Resize((518, 518)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+
+    class PaintingDataset(Dataset):
+        def __init__(self, indices, transform):
+            self.indices = indices
+            self.transform = transform
+        def __len__(self):
+            return len(self.indices)
+        def __getitem__(self, idx):
+            i = self.indices[idx]
+            img = Image.open(img_paths[i]).convert("RGB")
+            return self.transform(img), labels[i]
+
+    lr = 5e-5
+    weight_decay = 0.01
+    epochs = 50
+    patience = 10
+    batch_size = 4
+
+    def _train_lora_fold(train_idx, val_idx, fold_label=""):
+        """Train one LoRA fold, return best validation balanced accuracy."""
+        train_ds = PaintingDataset(train_idx, train_transform)
+        val_ds = PaintingDataset(val_idx, val_transform)
+
+        train_labels = labels[train_idx]
+        class_counts = np.bincount(train_labels, minlength=2)
+        if class_counts[0] == 0 or class_counts[1] == 0:
+            print(f"    {fold_label}: SKIP (single class in train)")
+            return None
+        class_weights = 1.0 / class_counts
+        sample_weights = class_weights[train_labels]
+        sampler = WeightedRandomSampler(sample_weights, len(sample_weights), replacement=True)
+
+        train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=sampler, num_workers=0)
+        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
+
+        model, _ = _build_lora_model()
+        model.to(device)
+        optimizer = torch.optim.AdamW(
+            [p for p in model.parameters() if p.requires_grad],
+            lr=lr, weight_decay=weight_decay
+        )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+        criterion = nn.BCEWithLogitsLoss()
+
+        best_val_bal_acc = 0
+        best_epoch = 0
+        no_improve = 0
+
+        for epoch in range(epochs):
+            model.train()
+            for X_batch, y_batch in train_loader:
+                X_batch = X_batch.to(device)
+                y_batch = y_batch.float().to(device)
+                optimizer.zero_grad()
+                logits = model(X_batch)
+                loss = criterion(logits, y_batch)
+                loss.backward()
+                optimizer.step()
+            scheduler.step()
+
+            model.eval()
+            val_preds, val_true = [], []
+            with torch.no_grad():
+                for X_batch, y_batch in val_loader:
+                    X_batch = X_batch.to(device)
+                    logits = model(X_batch)
+                    preds = (logits > 0).long().cpu().numpy()
+                    val_preds.extend(preds)
+                    val_true.extend(y_batch.numpy())
+            val_bal_acc = balanced_accuracy_score(val_true, val_preds)
+
+            if val_bal_acc > best_val_bal_acc:
+                best_val_bal_acc = val_bal_acc
+                best_epoch = epoch + 1
+                no_improve = 0
+            else:
+                no_improve += 1
+                if no_improve >= patience:
+                    break
+
+        del model
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+        print(f"    {fold_label}: {best_val_bal_acc:.3f} (epoch {best_epoch})")
+        return best_val_bal_acc
+
+    # --- C2: Leave-artist-out ---
+    print(f"\n  === C2: Leave-artist-out ===")
+    c2_results = []
+    for test_artist in unique_artists:
+        test_mask = artists == test_artist
+        train_mask = ~test_mask
+        test_idx = np.where(test_mask)[0]
+        train_idx = np.where(train_mask)[0]
+
+        n_test_auto = int((labels[test_idx] == 1).sum())
+        n_test_circle = len(test_idx) - n_test_auto
+        if n_test_auto == 0 or n_test_circle == 0:
+            print(f"    {test_artist}: SKIP (only one class)")
+            c2_results.append({"artist": test_artist, "bal_acc": None})
+            continue
+
+        bal_acc = _train_lora_fold(train_idx, test_idx, fold_label=test_artist)
+        c2_results.append({"artist": test_artist, "bal_acc": round(bal_acc, 4) if bal_acc else None,
+                           "n_auto": n_test_auto, "n_circle": n_test_circle})
+
+    valid_c2 = [r for r in c2_results if r["bal_acc"] is not None]
+    mean_c2 = np.mean([r["bal_acc"] for r in valid_c2]) if valid_c2 else 0
+    rembrandt_c2 = next((r["bal_acc"] for r in c2_results if r["artist"] == "rembrandt"), None)
+
+    print(f"\n{'='*60}")
+    print(f"  EXPERIMENT C RESULTS")
+    print(f"{'='*60}")
+    print(f"  C2 leave-artist-out mean: {mean_c2:.3f}")
+    print(f"  C2 Rembrandt:             {rembrandt_c2:.3f}" if rembrandt_c2 else "  C2 Rembrandt: N/A")
+    print(f"  vs Exp B (LoRA Rembrandt): compare manually")
+    print(f"{'='*60}")
+
+    results = {
+        "c2_leave_artist_out": c2_results,
+        "c2_mean": round(mean_c2, 4),
+        "c2_rembrandt": rembrandt_c2,
+        "n_total": n, "n_autograph": n_auto, "n_circle": n_circle,
+    }
+    with open(RESULTS_LORA_TRANSFER_JSON, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"  Saved → {RESULTS_LORA_TRANSFER_JSON}")
+
+
+# ---------------------------------------------------------------------------
+# Experiment D: Two-phase LoRA transfer
+# ---------------------------------------------------------------------------
+
+def stage_lora_curriculum(transfer_rows, rembrandt_rows):
+    """Two-phase LoRA: pre-train on 5 non-Rembrandt artists, fine-tune on Rembrandt.
+
+    Phase 1: Train LoRA on non-Rembrandt (autograph vs circle). Save weights.
+    Phase 2: Load phase 1 weights, fine-tune on Rembrandt with lower LR.
+    Evaluate: 5-fold CV on Rembrandt for phase 2 only.
+    """
+    import torch
+    import torch.nn as nn
+    from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+    from torchvision import transforms
+    from sklearn.model_selection import StratifiedKFold
+    from sklearn.metrics import balanced_accuracy_score
+
+    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    print(f"\n[Exp D] Two-phase LoRA curriculum. Device: {device}")
+
+    # Phase 1 data: non-Rembrandt transfer artists
+    phase1_rows = [r for r in transfer_rows
+                   if r.get("artist", "") != "rembrandt"
+                   and (r["artist_group"].endswith("_autograph") or r["artist_group"].endswith("_circle"))]
+    phase1_paths = []
+    phase1_labels = []
+    for r in phase1_rows:
+        path = CACHE_IMG / f"{r['obj_id']}.jpg"
+        if path.exists():
+            phase1_paths.append(path)
+            phase1_labels.append(1 if r["artist_group"].endswith("_autograph") else 0)
+    phase1_labels = np.array(phase1_labels)
+    print(f"  Phase 1 data: {int(phase1_labels.sum())} auto + "
+          f"{len(phase1_labels) - int(phase1_labels.sum())} circle = {len(phase1_labels)} non-Rembrandt")
+
+    # Phase 2 data: Rembrandt only
+    phase2_ac = [(r, 1 if r["artist_group"] in ("rembrandt_autograph",) else 0)
+                 for r in rembrandt_rows
+                 if r["artist_group"] in ("rembrandt_autograph", "rembrandt_circle")]
+    phase2_paths = []
+    phase2_labels = []
+    for r, y in phase2_ac:
+        path = CACHE_IMG / f"{r['obj_id']}.jpg"
+        if path.exists():
+            phase2_paths.append(path)
+            phase2_labels.append(y)
+    phase2_labels = np.array(phase2_labels)
+    n_auto = int(phase2_labels.sum())
+    n_circle = len(phase2_labels) - n_auto
+    print(f"  Phase 2 data: {n_auto} auto + {n_circle} circle = {len(phase2_labels)} Rembrandt")
+
+    train_transform = transforms.Compose([
+        transforms.Resize((518, 518)),
+        transforms.RandomHorizontalFlip(p=0.3),
+        transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.05),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+    val_transform = transforms.Compose([
+        transforms.Resize((518, 518)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+
+    class PathDataset(Dataset):
+        def __init__(self, paths, labels, transform):
+            self.paths = paths
+            self.labels = labels
+            self.transform = transform
+        def __len__(self):
+            return len(self.paths)
+        def __getitem__(self, idx):
+            img = Image.open(self.paths[idx]).convert("RGB")
+            return self.transform(img), self.labels[idx]
+
+    class IndexDataset(Dataset):
+        def __init__(self, indices, paths, labels, transform):
+            self.indices = indices
+            self.paths = paths
+            self.labels = labels
+            self.transform = transform
+        def __len__(self):
+            return len(self.indices)
+        def __getitem__(self, idx):
+            i = self.indices[idx]
+            img = Image.open(self.paths[i]).convert("RGB")
+            return self.transform(img), self.labels[i]
+
+    # --- Phase 1: Pre-train on 5 artists ---
+    print(f"\n  === Phase 1: Pre-train on non-Rembrandt artists ===")
+    phase1_epochs = 30
+    phase1_patience = 7
+    phase1_lr = 5e-5
+    batch_size = 4
+
+    model, trainable = _build_lora_model()
+    print(f"  Trainable params: {trainable:,}")
+    model.to(device)
+
+    phase1_ds = PathDataset(phase1_paths, phase1_labels, train_transform)
+    class_counts = np.bincount(phase1_labels, minlength=2)
+    class_weights = 1.0 / class_counts
+    sample_weights = class_weights[phase1_labels]
+    sampler = WeightedRandomSampler(sample_weights, len(sample_weights), replacement=True)
+    phase1_loader = DataLoader(phase1_ds, batch_size=batch_size, sampler=sampler, num_workers=0)
+
+    optimizer = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=phase1_lr, weight_decay=0.01
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=phase1_epochs)
+    criterion = nn.BCEWithLogitsLoss()
+
+    best_loss = float("inf")
+    no_improve = 0
+    for epoch in range(phase1_epochs):
+        model.train()
+        epoch_loss = 0
+        n_batches = 0
+        for X_batch, y_batch in phase1_loader:
+            X_batch = X_batch.to(device)
+            y_batch = y_batch.float().to(device)
+            optimizer.zero_grad()
+            logits = model(X_batch)
+            loss = criterion(logits, y_batch)
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+            n_batches += 1
+        avg_loss = epoch_loss / max(n_batches, 1)
+        scheduler.step()
+
+        if (epoch + 1) % 5 == 0 or epoch == 0:
+            print(f"    Epoch {epoch + 1:2d}: loss={avg_loss:.4f}")
+
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            no_improve = 0
+        else:
+            no_improve += 1
+            if no_improve >= phase1_patience:
+                print(f"    Early stop at epoch {epoch + 1}")
+                break
+
+    # Save phase 1 weights
+    phase1_weights_path = CACHE_DIR / "lora_phase1_weights.pt"
+    torch.save({k: v for k, v in model.state_dict().items()}, phase1_weights_path)
+    print(f"  Phase 1 complete. Saved weights → {phase1_weights_path}")
+    del model, optimizer, scheduler
+    if torch.backends.mps.is_available():
+        torch.mps.empty_cache()
+
+    # --- Phase 2: Fine-tune on Rembrandt (5-fold CV) ---
+    print(f"\n  === Phase 2: Fine-tune on Rembrandt (5-fold CV) ===")
+    phase2_lr = 1e-5  # Lower LR for fine-tuning
+    phase2_epochs = 50
+    phase2_patience = 10
+
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    fold_results = []
+
+    for fold, (train_idx, val_idx) in enumerate(skf.split(phase2_paths, phase2_labels)):
+        print(f"\n  --- Fold {fold + 1}/5 ---")
+        train_ds = IndexDataset(train_idx, phase2_paths, phase2_labels, train_transform)
+        val_ds = IndexDataset(val_idx, phase2_paths, phase2_labels, val_transform)
+
+        train_labels = phase2_labels[train_idx]
+        class_counts = np.bincount(train_labels, minlength=2)
+        class_weights = 1.0 / class_counts
+        sample_weights = class_weights[train_labels]
+        sampler = WeightedRandomSampler(sample_weights, len(sample_weights), replacement=True)
+
+        train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=sampler, num_workers=0)
+        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
+
+        # Load fresh model with phase 1 weights
+        model, _ = _build_lora_model()
+        model.load_state_dict(torch.load(phase1_weights_path, weights_only=True))
+        model.to(device)
+
+        optimizer = torch.optim.AdamW(
+            [p for p in model.parameters() if p.requires_grad],
+            lr=phase2_lr, weight_decay=0.01
+        )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=phase2_epochs)
+        criterion = nn.BCEWithLogitsLoss()
+
+        best_val_bal_acc = 0
+        best_epoch = 0
+        no_improve = 0
+
+        for epoch in range(phase2_epochs):
+            model.train()
+            for X_batch, y_batch in train_loader:
+                X_batch = X_batch.to(device)
+                y_batch = y_batch.float().to(device)
+                optimizer.zero_grad()
+                logits = model(X_batch)
+                loss = criterion(logits, y_batch)
+                loss.backward()
+                optimizer.step()
+            scheduler.step()
+
+            model.eval()
+            val_preds, val_true = [], []
+            with torch.no_grad():
+                for X_batch, y_batch in val_loader:
+                    X_batch = X_batch.to(device)
+                    logits = model(X_batch)
+                    preds = (logits > 0).long().cpu().numpy()
+                    val_preds.extend(preds)
+                    val_true.extend(y_batch.numpy())
+            val_bal_acc = balanced_accuracy_score(val_true, val_preds)
+
+            if (epoch + 1) % 5 == 0 or epoch == 0:
+                print(f"    Epoch {epoch + 1:2d}: val_bal_acc={val_bal_acc:.3f}")
+
+            if val_bal_acc > best_val_bal_acc:
+                best_val_bal_acc = val_bal_acc
+                best_epoch = epoch + 1
+                no_improve = 0
+            else:
+                no_improve += 1
+                if no_improve >= phase2_patience:
+                    print(f"    Early stop at epoch {epoch + 1} (best: {best_val_bal_acc:.3f} at epoch {best_epoch})")
+                    break
+
+        print(f"  Fold {fold + 1} best: {best_val_bal_acc:.3f} (epoch {best_epoch})")
+        fold_results.append({
+            "fold": fold + 1,
+            "best_val_bal_acc": round(best_val_bal_acc, 4),
+            "best_epoch": best_epoch,
+        })
+        del model
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+
+    accs = [r["best_val_bal_acc"] for r in fold_results]
+    mean_acc = np.mean(accs)
+    std_acc = np.std(accs)
+
+    print(f"\n{'='*60}")
+    print(f"  EXPERIMENT D RESULTS (Two-phase LoRA)")
+    print(f"{'='*60}")
+    print(f"  Phase 1: {len(phase1_labels)} non-Rembrandt paintings")
+    print(f"  Phase 2: {len(phase2_labels)} Rembrandt paintings")
+    print(f"  Phase 2 LR: {phase2_lr}")
+    print(f"  Folds:            {', '.join(f'{a:.3f}' for a in accs)}")
+    print(f"  Mean bal acc:     {mean_acc:.3f} ± {std_acc:.3f}")
+    print(f"  vs Exp B (LoRA):  compare manually")
+    print(f"  vs frozen best:   63.7% (entropy SVM RBF)")
+    print(f"{'='*60}")
+
+    results = {
+        "model": "DINOv2 ViT-B/14 + LoRA (two-phase curriculum)",
+        "phase1_n": len(phase1_labels),
+        "phase2_n": len(phase2_labels),
+        "phase1_lr": phase1_lr,
+        "phase2_lr": phase2_lr,
+        "n_autograph": n_auto,
+        "n_circle": n_circle,
+        "fold_results": fold_results,
+        "mean_bal_acc": round(float(mean_acc), 4),
+        "std_bal_acc": round(float(std_acc), 4),
+    }
+    with open(RESULTS_LORA_CURRICULUM_JSON, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"\n  Saved → {RESULTS_LORA_CURRICULUM_JSON}")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
