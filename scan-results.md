@@ -1,5 +1,5 @@
 ---
-version: 0.8.0
+version: 0.9.0
 date: 2026-03-03
 status: active
 ---
@@ -506,3 +506,86 @@ The similarity between CLIP (62.9%) and DINOv2 mean (59.0%) suggests both founda
 | `cache/embeddings/embeddings_tiles.npz` | Per-tile CLS embeddings (37K tiles, 106MB) |
 | `cache/embeddings/embeddings_clip.npz` | CLIP ViT-L/14 embeddings (768d) |
 | `cache/plots/` | UMAP, cosine, heatmap for latest run |
+| `cache/metadata/inventory_transfer.csv` | Transfer corpus inventory (~6K paintings, 6 artists) |
+| `cache/embeddings/embeddings_transfer.npz` | Transfer corpus entropy-weighted embeddings |
+| `cache/results_transfer.json` | Experiment A results (frozen transfer probe) |
+| `cache/results_lora.json` | Experiment B results (LoRA Rembrandt-only) |
+| `cache/results_lora_transfer.json` | Experiment C results (LoRA leave-artist-out) |
+| `cache/results_lora_curriculum.json` | Experiment D results (two-phase curriculum) |
+
+## Tier 3: Multi-Artist Transfer Learning + LoRA (Implemented, Not Yet Run)
+
+### Motivation
+
+Two independent problems to solve:
+1. **Overfitting** — Option I has 14.2M params for 568 samples. LoRA reduces to ~148K params.
+2. **Data scarcity** — 568 Rembrandt paintings may not be enough to learn "workshop-ness." Multi-artist transfer provides 5-10x more training data.
+
+Nobody has published multi-artist transfer for authentication or used DINOv2 for this. Published 94-98% numbers are on easier variants (master vs different artist). We're in novel territory.
+
+### Transfer corpus (Wikidata SPARQL)
+
+| Artist | QID | Autograph | Workshop | Total |
+|--------|-----|----------:|--------:|------:|
+| Rubens | Q5599 | ~1,598 | ~172 | ~1,770 |
+| Cranach | Q191748 | ~923 | ~230 | ~1,153 |
+| Van Dyck | Q150679 | ~1,306 | ~140 | ~1,446 |
+| Titian | Q47551 | ~401 | ~103 | ~504 |
+| Frans Hals | Q167654 | ~298 | ~99 | ~397 |
+| Rembrandt | Q5598 | ~562 | ~149 | ~711 |
+| **Total** | | **~5,088** | **~893** | **~5,981** |
+
+Dropped: Raphael (13 workshop), Vermeer (7 workshop), Caravaggio (16 workshop) — too few workshop paintings.
+
+### Experiments
+
+| Exp | What | Training data | Trainable params | Question |
+|-----|------|--------------|-----------------|----------|
+| A | Pooled frozen probe | ~6K all artists | 0 (SVM) | Does cross-artist frozen transfer work? |
+| B | LoRA Rembrandt-only | 568 Rembrandt | ~148K | Does LoRA fix Option I overfitting? |
+| C | LoRA leave-artist-out | ~5.1K non-Rembrandt | ~148K | Does multi-artist LoRA generalize? |
+| D | LoRA pre-train → fine-tune | 5.1K then 568 | ~148K | Does curriculum transfer beat LoRA-only? |
+
+**LoRA config:** peft v0.18.1, rank=8, alpha=16, dropout=0.1, applied to QKV + proj in last 4/12 transformer blocks. 148,225 trainable params (0.17% of model). Classification head: Linear(768→1) with BCEWithLogitsLoss.
+
+**Training:** 5-fold stratified CV, WeightedRandomSampler for class balance, AdamW (lr=5e-5, wd=0.01), cosine LR schedule, patience=10, max 50 epochs, batch_size=4, images resized to 518×518.
+
+**Success criteria:** Beat 63.7% on Rembrandt balanced accuracy. >70% = strong signal. >75% = publication-worthy.
+
+### Decision tree
+
+```
+B > 63.7%? ──yes──→ LoRA works. Run C/D for transfer.
+    │
+    no ──→ LoRA doesn't help either. Bottleneck is data representation,
+           not training method. Consider Tier 2 pivot (Option N: wrong-artist detector).
+
+A2 > 55%? ──yes──→ Cross-artist transfer has signal. Run C/D.
+    │
+    no ──→ Workshop features are artist-specific. Multi-artist transfer won't help.
+           Focus on B (LoRA Rembrandt-only) and Tier 2.
+
+D > B? ──yes──→ Transfer learning adds value beyond LoRA alone. Paper-worthy result.
+    │
+    no ──→ Multi-artist data doesn't help Rembrandt specifically.
+           Ship B (LoRA) as the best model. Consider Option N pivot.
+```
+
+### Execution sequence
+
+```bash
+# Step 1: Fetch transfer metadata + download images + embed (~8h compute)
+python scan.py --corpus transfer
+
+# Step 2: Run experiments
+python scan.py --transfer-probe     # Exp A: ~30min
+python scan.py --lora               # Exp B: ~1-2h (independent of Step 1)
+python scan.py --lora-transfer      # Exp C: ~3-4h (needs Step 1)
+python scan.py --lora-curriculum    # Exp D: ~2-3h (needs Steps 1 + Rembrandt data)
+```
+
+Exp B is independent of the transfer corpus — can run immediately on existing Rembrandt data. Exp A/C/D require the transfer corpus to be fetched and embedded first.
+
+### Results
+
+*Not yet run. Results will be added here as experiments complete.*
