@@ -1,6 +1,6 @@
 ---
-version: 0.7.0
-date: 2026-03-02
+version: 0.8.0
+date: 2026-03-03
 status: active
 ---
 
@@ -130,7 +130,7 @@ Circle/disputed group expanded from N=2 (prototype) to N=18 — the primary goal
 | KNN K=7 | 75.9% |
 | Baseline | 73.1% |
 
-## Comparison: Prototype → v1 → v2 → v1-L → v1-D → v1-F → v1-H → v1-G
+## Comparison: All configurations
 
 | Metric | Prototype | v1 ViT-B | v2 (hi-res) | v1-L ViT-L | v1-D Entropy | v1-F Probe | v1-H Non-lin | v1-G Wikidata |
 |--------|-----------|----------|-------------|------------|--------------|------------|--------------|---------------|
@@ -160,7 +160,7 @@ Circle/disputed group expanded from N=2 (prototype) to N=18 — the primary goal
 
 7. **Pupil/other separation is real and robust.** p=2e-11 for pupils and 3e-10 for other Dutch masters (v1 ViT-B). DINOv2 is a "different artist" detector, not an authenticator.
 
-8. **Next frontier: fine-tuning.** Frozen embeddings peak at 63.7% (entropy + SVM RBF). Option I (LoRA fine-tuning) is the clear next step — with N=711, fine-tuning is feasible where it wasn't at N=47. Entropy-weighted features should be the starting point for fine-tuning experiments.
+8. **Tier 1 exhausted — frozen-feature ceiling is 63.7%.** Seven configurations tested: ViT-B mean (59.0%), ViT-L (59.5%), fine-tune (60.0%), per-tile voting (60.2%), concat (62.3%), CLIP (62.9%), entropy SVM RBF (**63.7%**). All converge on the same limit. The autograph/circle boundary in frozen vision transformer features is fundamentally weak. Next frontier is Tier 2 (diagnostic regions, metadata hybrid) or Tier 3 (multi-artist transfer learning).
 
 ## v1-F: Linear probe on frozen embeddings (supervised)
 
@@ -223,19 +223,25 @@ This eliminates classifier capacity as a variable. The 72.3% ceiling is a featur
 | D re-run (entropy, N=711) | **63.7% bal acc** — best probe config | Entropy helps supervised but destroys unsupervised pupil/other |
 | K: Concat (B+L+entropy, 5120d) | 62.3% bal acc (Logistic, p=0.001) | Concatenation diluted entropy signal. PCA 20 from 5120d too aggressive. |
 | I: Fine-tune (last 2 blocks) | 60.0% ± 5.0% (5-fold CV) | Overfits by epoch 10, doesn't beat frozen entropy. N=568 too small for 14M params. |
+| E: Per-tile classification | 60.2% vote bal acc (SVM RBF, C=1.0) | Tile-level labels too noisy, majority voting can't recover signal. Doesn't beat entropy. |
+| J: CLIP ViT-L/14 | 62.9% bal acc, p=0.001 (SVM RBF) | Different foundation model, similar result. Overlapping style info with DINOv2. |
 
 ## Next Steps
 
-### Tier 1: Remaining frozen-feature experiments
+### Tier 1: EXHAUSTED — All frozen-feature experiments complete
 
-| # | Approach | Hypothesis | Effort |
-|---|----------|-----------|--------|
-| I | **Fine-tune DINOv2** | LoRA or last-layer fine-tuning on authentication labels. N=711 makes this feasible. Could push past the 63.7% frozen-feature ceiling. | ~8 hr |
-| E | **Per-tile classification** | Classify individual tiles and vote — bypasses mean-pooling information loss. Each painting → ~64 training examples. | ~2 hr |
-| J | **CLIP / SigLIP features** | Different foundation model may encode different visual info. CLIP trained on text-image pairs — may capture iconographic/compositional features DINOv2 misses. | ~2 hr |
-| K | **Feature concatenation** | Combine DINOv2 mean + entropy + ViT-L into one wide vector. Let classifier sort out which aggregation matters. PCA handles dimensionality. | ~1 hr |
+| # | Approach | Result | Status |
+|---|----------|--------|--------|
+| I | Fine-tune DINOv2 | 60.0% ± 5.0% | Eliminated — overfits |
+| E | Per-tile classification | 60.2% | Eliminated — noisy tile labels |
+| J | CLIP ViT-L/14 | 62.9% | Eliminated — similar to DINOv2 |
+| K | Feature concatenation | 62.3% | Eliminated — diluted entropy |
+| C | ViT-L/14 re-run | 59.5% | Eliminated — no gain |
+| D | Entropy re-run | **63.7%** | **Best frozen-feature result** |
 
-### Tier 2: Beyond frozen embeddings (if I–K don't reach ~80%)
+**Ceiling: 63.7% balanced accuracy** (entropy-weighted DINOv2 ViT-B/14 + SVM RBF). All Tier 1 paths converge on this limit. The frozen-feature space for Rembrandt autograph/circle is exhausted.
+
+### Tier 2: Beyond frozen embeddings
 
 | # | Approach | What | Step change? |
 |---|----------|------|-------------|
@@ -427,6 +433,60 @@ N=568 training paintings is insufficient for 14.2M trainable parameters — even
 
 This confirms the Tier 3 hypothesis: the bottleneck is training data volume, not model capacity or feature representation. Multi-artist pre-training (Rubens, Cranach, Titian, etc.) is the logical next step — learn general "autograph vs workshop" features from thousands of paintings before attempting Rembrandt-specific fine-tuning.
 
+## v1-E: Per-tile classification with majority voting (Option E)
+
+**Config:** Re-embed all 711 autograph+circle paintings at tile level — save per-tile CLS tokens (not averaged). DINOv2 ViT-B/14, 224×224 tiles, same 2000px images. 37,340 tiles from 711 paintings (avg ~52 tiles/painting). Stratified 10-fold CV: PCA(20) on tiles, SVM RBF with class_weight=balanced on tile labels (each tile inherits painting label), painting-level majority voting on validation set.
+
+### Grid search results
+
+| C | Tile acc | Vote acc |
+|---|---------|---------|
+| 0.01 | 0.602 | 0.536 |
+| 0.1 | 0.581 | 0.595 |
+| 1.0 | 0.597 | **0.602** |
+| 10.0 | 0.618 | 0.574 |
+
+Best: C=1.0 → **60.2% vote balanced accuracy**. Permutation test not completed (SVM on 37K tiles × 200 permutations × 10 folds prohibitively expensive on CPU).
+
+### Interpretation
+
+Per-tile classification (60.2%) does **not** beat whole-painting entropy-weighted probes (63.7%). The tile-level SVM achieves only ~60% accuracy on individual tiles — barely above chance — so majority voting can't recover much signal. The tile-level approach explodes the dataset size (37K tiles vs 711 paintings) but each tile inherits a noisy label from its parent painting. A "circle" painting likely has some tiles that look indistinguishable from "autograph" tiles. The mean-pooling information loss we hoped to circumvent is less important than the label noise we introduced.
+
+Interesting: tile accuracy at C=10.0 (61.8%) is higher than at C=1.0 (59.7%), but vote accuracy reverses (57.4% vs 60.2%). Aggressive C makes confident per-tile predictions that aggregate poorly — the model overcommits on ambiguous tiles.
+
+## v1-J: CLIP ViT-L/14 features (Option J)
+
+**Config:** OpenAI CLIP ViT-L/14 (768d image embeddings). Whole-painting embedding (center-crop to 224×224), L2-normalized. PCA + probe with balanced class weights, stratified 10-fold CV, permutation test (1000 shuffles).
+
+### Probe results
+
+| Classifier | Best PCA | Best param | 10-fold balanced acc |
+|------------|----------|------------|---------------------|
+| Logistic | 20 | C=1.0 | 0.618 |
+| **SVM RBF** | **10** | **C=1.0** | **0.629** |
+
+Permutation p = **0.001** (null mean = 0.499 ± 0.031).
+
+### Interpretation
+
+CLIP ViT-L/14 (62.9%) is competitive but does **not** beat DINOv2 entropy-weighted (63.7%). CLIP was trained on text-image contrastive learning (400M image-text pairs) while DINOv2 was self-supervised on images only. Both encode useful stylistic information, but DINOv2's entropy-weighted variant captures brushwork-level detail that CLIP's text-alignment training doesn't prioritize.
+
+The similarity between CLIP (62.9%) and DINOv2 mean (59.0%) suggests both foundation models extract overlapping style information. The +4.7% entropy gain over DINOv2 mean is specific to DINOv2's patch token variance — CLIP has no equivalent mechanism.
+
+### Full probe comparison (expanded dataset, all configs)
+
+| Config | Best balanced acc | p-value | Method |
+|--------|------------------|---------|--------|
+| ViT-B mean (G) | 59.0% | 0.003 | Frozen + SVM RBF |
+| ViT-L mean (C) | 59.5% | 0.001 | Frozen + SVM RBF |
+| Fine-tune (I) | 60.0% ± 5.0% | — | Last 2 blocks + linear head |
+| Per-tile vote (E) | 60.2% | — | Tile SVM + majority vote |
+| Concat B+L+entropy (K) | 62.3% | 0.001 | Frozen + Logistic |
+| CLIP ViT-L/14 (J) | 62.9% | 0.001 | Frozen + SVM RBF |
+| **ViT-B entropy (D)** | **63.7%** | **0.001** | **Frozen + SVM RBF** |
+
+**Entropy-weighted DINOv2 is the clear winner.** All Tier 1 options (I, E, J, K) exhausted. None breaks 64%. The frozen-feature ceiling for Rembrandt autograph/circle classification is ~63.7% balanced accuracy. Next: Tier 2 (diagnostic regions, metadata hybrid) or Tier 3 (multi-artist transfer).
+
 ## Files
 
 | File | What |
@@ -440,4 +500,9 @@ This confirms the Tier 3 hypothesis: the bottleneck is training data volume, not
 | `cache/results_vitl.json` | v1-L ViT-L metrics |
 | `cache/results_entropy.json` | v1-D entropy-weighted metrics |
 | `cache/results_probe.json` | v1-F linear probe metrics |
+| `cache/results_finetune.json` | v1-I fine-tune metrics |
+| `cache/results_tiles.json` | v1-E per-tile probe metrics |
+| `cache/results_clip.json` | v1-J CLIP probe metrics |
+| `cache/embeddings/embeddings_tiles.npz` | Per-tile CLS embeddings (37K tiles, 106MB) |
+| `cache/embeddings/embeddings_clip.npz` | CLIP ViT-L/14 embeddings (768d) |
 | `cache/plots/` | UMAP, cosine, heatmap for latest run |

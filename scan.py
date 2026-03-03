@@ -1780,6 +1780,10 @@ def stage4b_probe(full_embeddings, artist_groups, painting_ids, rows):
 # ---------------------------------------------------------------------------
 
 RESULTS_FINETUNE_JSON = CACHE_DIR / "results_finetune.json"
+EMBEDDINGS_TILES_NPZ = CACHE_EMB / "embeddings_tiles.npz"
+RESULTS_TILES_JSON = CACHE_DIR / "results_tiles.json"
+RESULTS_CLIP_JSON = CACHE_DIR / "results_clip.json"
+EMBEDDINGS_CLIP_NPZ = CACHE_EMB / "embeddings_clip.npz"
 
 def stage_finetune(rows):
     """Fine-tune DINOv2 ViT-B/14 last 2 blocks + linear head for autograph vs circle.
@@ -1997,6 +2001,357 @@ def stage_finetune(rows):
 
 
 # ---------------------------------------------------------------------------
+# Option E: Per-tile classification
+# ---------------------------------------------------------------------------
+
+def stage_tiles(rows):
+    """Embed tiles individually (no averaging), then probe with painting-level voting."""
+    import torch
+    from torchvision import transforms
+    from sklearn.decomposition import PCA
+    from sklearn.svm import SVC
+    from sklearn.model_selection import StratifiedKFold
+    from sklearn.metrics import balanced_accuracy_score
+
+    # Check cache
+    if EMBEDDINGS_TILES_NPZ.exists():
+        print("[Tiles] Loading cached per-tile embeddings...")
+        data = np.load(EMBEDDINGS_TILES_NPZ, allow_pickle=True)
+        tile_embs = data["tile_embeddings"]        # list of arrays, one per painting
+        tile_counts = data["tile_counts"]           # number of tiles per painting
+        painting_ids = data["painting_ids"]
+        artist_groups = data["artist_groups"]
+    else:
+        # Re-embed, saving per-tile features
+        device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+        print(f"[Tiles] Embedding per-tile features on {device}...")
+
+        dino_transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+        model = torch.hub.load("facebookresearch/dinov2", "dinov2_vitb14")
+        model = model.to(device).eval()
+
+        all_tile_embs = []  # flat array of all tile embeddings
+        tile_counts = []
+        painting_ids = []
+        artist_groups = []
+
+        ac_rows = [r for r in rows if r["artist_group"] in ("rembrandt_autograph", "rembrandt_circle")]
+        print(f"  {len(ac_rows)} autograph+circle paintings to embed")
+
+        for i, row in enumerate(ac_rows):
+            img_path = CACHE_IMG / f"{row['obj_id']}.jpg"
+            if not img_path.exists():
+                continue
+            img = Image.open(img_path).convert("RGB")
+            tile_cls = []
+            for batch_tensor in _tile_batches(img, TILE_SIZE, BATCH_SIZE_VITB, dino_transform):
+                batch_tensor = batch_tensor.to(device)
+                with torch.no_grad():
+                    out = model.forward_features(batch_tensor)
+                    tile_cls.append(out["x_norm_clstoken"].cpu().numpy())
+            del img
+            tile_cls = np.concatenate(tile_cls, axis=0)  # (N_tiles, 768)
+            all_tile_embs.append(tile_cls)
+            tile_counts.append(len(tile_cls))
+            painting_ids.append(row["obj_id"])
+            artist_groups.append(row["artist_group"])
+            if (i + 1) % 50 == 0:
+                print(f"    {i + 1}/{len(ac_rows)} done")
+
+        painting_ids = np.array(painting_ids)
+        artist_groups = np.array(artist_groups)
+        tile_counts = np.array(tile_counts)
+        # Save as flat array + counts for reconstruction
+        tile_embs = np.concatenate(all_tile_embs, axis=0)
+        np.savez_compressed(EMBEDDINGS_TILES_NPZ,
+                            tile_embeddings=tile_embs,
+                            tile_counts=tile_counts,
+                            painting_ids=painting_ids,
+                            artist_groups=artist_groups)
+        print(f"  Saved {len(tile_embs)} tiles from {len(painting_ids)} paintings → {EMBEDDINGS_TILES_NPZ}")
+
+    # Reconstruct per-painting tile arrays
+    y = np.array([1 if g == "rembrandt_autograph" else 0 for g in artist_groups])
+    n = len(y)
+    n_auto = int(y.sum())
+    n_circle = n - n_auto
+    total_tiles = int(tile_counts.sum()) if isinstance(tile_counts, np.ndarray) else sum(tile_counts)
+    print(f"\n[Tiles] Probe: {n_auto} autograph + {n_circle} circle = {n} paintings, {total_tiles} tiles")
+
+    # Reconstruct tile arrays per painting from flat array
+    if isinstance(tile_embs, np.ndarray) and tile_embs.ndim == 2:
+        # Flat array — reconstruct
+        per_painting_tiles = []
+        offset = 0
+        for count in tile_counts:
+            per_painting_tiles.append(tile_embs[offset:offset + int(count)])
+            offset += int(count)
+    else:
+        per_painting_tiles = list(tile_embs)
+
+    # Stratified 10-fold CV with tile-level SVM + painting-level majority vote
+    pca_dims = 20
+    C_values = [0.01, 0.1, 1.0, 10.0]
+    skf = StratifiedKFold(n_splits=10, shuffle=True, random_state=42)
+
+    print(f"  PCA={pca_dims}, SVM RBF with class_weight=balanced")
+    print(f"  {'C':<10} {'Tile acc':<12} {'Vote acc':<12}")
+    print(f"  {'-'*10} {'-'*12} {'-'*12}")
+
+    best_vote_acc = 0
+    best_C = 0
+
+    for C in C_values:
+        tile_accs = []
+        vote_accs = []
+        for train_idx, val_idx in skf.split(np.zeros(n), y):
+            # Gather train tiles
+            train_tiles = np.concatenate([per_painting_tiles[i] for i in train_idx])
+            train_labels = np.concatenate([np.full(len(per_painting_tiles[i]), y[i]) for i in train_idx])
+            # PCA on train tiles
+            pca = PCA(n_components=pca_dims, random_state=42)
+            train_pca = pca.fit_transform(train_tiles)
+            # Train SVM
+            clf = SVC(C=C, kernel="rbf", gamma="scale", class_weight="balanced")
+            clf.fit(train_pca, train_labels)
+            # Predict val tiles
+            painting_preds = []
+            painting_true = []
+            tile_correct = 0
+            tile_total = 0
+            for i in val_idx:
+                tiles_pca = pca.transform(per_painting_tiles[i])
+                tile_preds = clf.predict(tiles_pca)
+                # Majority vote
+                vote = int(tile_preds.sum() > len(tile_preds) / 2)
+                painting_preds.append(vote)
+                painting_true.append(y[i])
+                tile_correct += (tile_preds == y[i]).sum()
+                tile_total += len(tile_preds)
+            tile_accs.append(tile_correct / tile_total)
+            vote_accs.append(balanced_accuracy_score(painting_true, painting_preds))
+
+        mean_tile = np.mean(tile_accs)
+        mean_vote = np.mean(vote_accs)
+        print(f"  {C:<10} {mean_tile:<12.3f} {mean_vote:<12.3f}")
+        if mean_vote > best_vote_acc:
+            best_vote_acc = mean_vote
+            best_C = C
+
+    print(f"\n  Best: C={best_C} → {best_vote_acc:.3f} vote balanced accuracy")
+
+    # Permutation test on best
+    n_perms = 200
+    print(f"\n  Permutation test ({n_perms} shuffles)...")
+    null_accs = np.zeros(n_perms)
+    rng = np.random.RandomState(42)
+    for p in range(n_perms):
+        y_shuf = rng.permutation(y)
+        fold_accs = []
+        for train_idx, val_idx in skf.split(np.zeros(n), y_shuf):
+            train_tiles = np.concatenate([per_painting_tiles[i] for i in train_idx])
+            train_labels = np.concatenate([np.full(len(per_painting_tiles[i]), y_shuf[i]) for i in train_idx])
+            pca = PCA(n_components=pca_dims, random_state=42)
+            train_pca = pca.fit_transform(train_tiles)
+            clf = SVC(C=best_C, kernel="rbf", gamma="scale", class_weight="balanced")
+            clf.fit(train_pca, train_labels)
+            painting_preds, painting_true = [], []
+            for i in val_idx:
+                tiles_pca = pca.transform(per_painting_tiles[i])
+                tile_preds = clf.predict(tiles_pca)
+                vote = int(tile_preds.sum() > len(tile_preds) / 2)
+                painting_preds.append(vote)
+                painting_true.append(y_shuf[i])
+            fold_accs.append(balanced_accuracy_score(painting_true, painting_preds))
+        null_accs[p] = np.mean(fold_accs)
+        if (p + 1) % 100 == 0:
+            print(f"    {p + 1}/{n_perms} done")
+
+    p_value = (np.sum(null_accs >= best_vote_acc) + 1) / (n_perms + 1)
+    null_mean = null_accs.mean()
+    null_std = null_accs.std()
+
+    print(f"\n{'='*60}")
+    print(f"  TILE PROBE RESULTS (Option E)")
+    print(f"{'='*60}")
+    print(f"  N paintings:       {n} ({n_auto} auto + {n_circle} circle)")
+    print(f"  Total tiles:       {total_tiles}")
+    print(f"  Best C:            {best_C}")
+    print(f"  Vote bal acc:      {best_vote_acc:.3f}")
+    print(f"  Perm p-value:      {p_value:.4f}")
+    print(f"  Null mean ± std:   {null_mean:.3f} ± {null_std:.3f}")
+    print(f"{'='*60}")
+
+    results = {
+        "n_paintings": n, "n_autograph": n_auto, "n_circle": n_circle,
+        "total_tiles": int(total_tiles), "pca_dims": pca_dims,
+        "best_C": best_C, "vote_bal_acc": round(best_vote_acc, 4),
+        "perm_p_value": round(p_value, 4),
+        "null_mean": round(null_mean, 4), "null_std": round(null_std, 4),
+    }
+    with open(RESULTS_TILES_JSON, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"  Saved → {RESULTS_TILES_JSON}")
+
+
+# ---------------------------------------------------------------------------
+# Option J: CLIP features
+# ---------------------------------------------------------------------------
+
+def stage_clip(rows):
+    """Embed paintings with CLIP ViT-L/14 and run probe."""
+    import torch
+    from sklearn.decomposition import PCA
+    from sklearn.svm import SVC
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.model_selection import StratifiedKFold, cross_val_score
+
+    if EMBEDDINGS_CLIP_NPZ.exists():
+        print("[CLIP] Loading cached embeddings...")
+        data = np.load(EMBEDDINGS_CLIP_NPZ, allow_pickle=True)
+        painting_ids = data["painting_ids"]
+        embeddings = data["embeddings"]
+        artist_groups = data["artist_groups"]
+    else:
+        import open_clip
+
+        device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+        print(f"[CLIP] Device: {device}")
+        print("[CLIP] Loading CLIP ViT-L/14...")
+        model, _, preprocess = open_clip.create_model_and_transforms("ViT-L-14", pretrained="openai")
+        model = model.to(device).eval()
+
+        ac_rows = [r for r in rows if r["artist_group"] in ("rembrandt_autograph", "rembrandt_circle")]
+        print(f"  {len(ac_rows)} autograph+circle paintings to embed")
+
+        painting_ids = []
+        embeddings_list = []
+        artist_groups = []
+
+        for i, row in enumerate(ac_rows):
+            img_path = CACHE_IMG / f"{row['obj_id']}.jpg"
+            if not img_path.exists():
+                continue
+            img = Image.open(img_path).convert("RGB")
+            img_tensor = preprocess(img).unsqueeze(0).to(device)
+            with torch.no_grad():
+                features = model.encode_image(img_tensor)
+                features = features / features.norm(dim=-1, keepdim=True)  # L2 normalize
+            embeddings_list.append(features.cpu().numpy().squeeze())
+            painting_ids.append(row["obj_id"])
+            artist_groups.append(row["artist_group"])
+            del img
+            if (i + 1) % 50 == 0:
+                print(f"    {i + 1}/{len(ac_rows)} done")
+
+        painting_ids = np.array(painting_ids)
+        artist_groups = np.array(artist_groups)
+        embeddings = np.array(embeddings_list)
+        np.savez_compressed(EMBEDDINGS_CLIP_NPZ,
+                            painting_ids=painting_ids,
+                            embeddings=embeddings,
+                            artist_groups=artist_groups)
+        print(f"  Saved {len(embeddings)} × {embeddings.shape[1]}d → {EMBEDDINGS_CLIP_NPZ}")
+
+    y = np.array([1 if g == "rembrandt_autograph" else 0 for g in artist_groups])
+    n = len(y)
+    n_auto = int(y.sum())
+    n_circle = n - n_auto
+    print(f"\n[CLIP] Probe: {n_auto} autograph + {n_circle} circle = {n} paintings, {embeddings.shape[1]}d")
+
+    pca_dims_list = [10, 20]
+    C_values = [0.001, 0.01, 0.1, 1.0, 10.0]
+    skf = StratifiedKFold(n_splits=10, shuffle=True, random_state=42)
+
+    classifiers = [
+        ("Logistic", lambda v: LogisticRegression(C=v, solver="lbfgs", max_iter=1000, class_weight="balanced"),
+         "C", C_values),
+        ("SVM RBF", lambda v: SVC(C=v, kernel="rbf", gamma="scale", class_weight="balanced"),
+         "C", C_values),
+    ]
+
+    overall_best_acc = 0
+    overall_best = None
+    all_results = []
+
+    for clf_name, make_clf, param_name, param_values in classifiers:
+        print(f"\n  --- {clf_name} ---")
+        print(f"  {'PCA dims':<10} " + " ".join(f"{param_name}={v:<7}" for v in param_values))
+        print(f"  {'-'*10} " + " ".join(f"{'-'*10}" for _ in param_values))
+        best_acc, best_dims, best_param = 0, 0, 0
+        for dims in pca_dims_list:
+            pca = PCA(n_components=dims, random_state=42)
+            X_pca = pca.fit_transform(embeddings)
+            row_str = f"  {dims:<10}"
+            for v in param_values:
+                clf = make_clf(v)
+                scores = cross_val_score(clf, X_pca, y, cv=skf, scoring="balanced_accuracy")
+                acc = scores.mean()
+                row_str += f" {acc:<10.3f}"
+                if acc > best_acc:
+                    best_acc, best_dims, best_param = acc, dims, v
+            print(row_str)
+        print(f"  Best: PCA={best_dims}, {param_name}={best_param} → {best_acc:.3f}")
+        all_results.append({
+            "classifier": clf_name, "best_pca": best_dims,
+            "best_param": best_param, "bal_acc": round(best_acc, 4),
+        })
+        if best_acc > overall_best_acc:
+            overall_best_acc = best_acc
+            overall_best = (clf_name, best_dims, best_param, make_clf)
+
+    best_name, best_dims, best_param, best_make_clf = overall_best
+    print(f"\n  Overall best: {best_name} (PCA={best_dims}, C={best_param}) → {overall_best_acc:.3f}")
+
+    # Permutation test
+    n_perms = 1000
+    print(f"\n  Permutation test ({n_perms} shuffles)...")
+    pca = PCA(n_components=best_dims, random_state=42)
+    X_best = pca.fit_transform(embeddings)
+    null_accs = np.zeros(n_perms)
+    rng = np.random.RandomState(42)
+    for p in range(n_perms):
+        y_shuf = rng.permutation(y)
+        clf = best_make_clf(best_param)
+        scores = cross_val_score(clf, X_best, y_shuf, cv=skf, scoring="balanced_accuracy")
+        null_accs[p] = scores.mean()
+        if (p + 1) % 100 == 0:
+            print(f"    {p + 1}/{n_perms} done")
+
+    p_value = (np.sum(null_accs >= overall_best_acc) + 1) / (n_perms + 1)
+    null_mean = null_accs.mean()
+    null_std = null_accs.std()
+
+    print(f"\n{'='*60}")
+    print(f"  CLIP PROBE RESULTS (Option J)")
+    print(f"{'='*60}")
+    print(f"  Model:          CLIP ViT-L/14 (OpenAI)")
+    print(f"  N paintings:    {n} ({n_auto} auto + {n_circle} circle)")
+    print(f"  Embed dim:      {embeddings.shape[1]}")
+    print(f"  Best:           {best_name} PCA={best_dims} C={best_param}")
+    print(f"  Bal acc:        {overall_best_acc:.3f}")
+    print(f"  Perm p-value:   {p_value:.4f}")
+    print(f"  Null mean±std:  {null_mean:.3f} ± {null_std:.3f}")
+    print(f"{'='*60}")
+
+    results = {
+        "model": "CLIP ViT-L/14 (OpenAI)", "embed_dim": int(embeddings.shape[1]),
+        "n_autograph": n_auto, "n_circle": n_circle,
+        "best_classifier": best_name, "best_pca": best_dims,
+        "best_param": best_param, "bal_acc": round(overall_best_acc, 4),
+        "perm_p_value": round(p_value, 4),
+        "null_mean": round(null_mean, 4), "null_std": round(null_std, 4),
+        "all_classifiers": all_results,
+    }
+    with open(RESULTS_CLIP_JSON, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"  Saved → {RESULTS_CLIP_JSON}")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -2016,6 +2371,10 @@ def main():
                         help="Option K: concatenate ViT-B + ViT-L + entropy embeddings for probe")
     parser.add_argument("--finetune", action="store_true",
                         help="Option I: fine-tune DINOv2 last 2 blocks on autograph vs circle")
+    parser.add_argument("--tiles", action="store_true",
+                        help="Option E: per-tile classification with painting-level voting")
+    parser.add_argument("--clip", action="store_true",
+                        help="Option J: CLIP ViT-L/14 features for probe")
     parser.add_argument("--refetch", action="store_true",
                         help="Delete cached inventory + embeddings to force re-fetch from all sources")
     args = parser.parse_args()
@@ -2086,6 +2445,26 @@ def main():
         with open(INVENTORY_CSV) as f:
             rows = list(csv.DictReader(f))
         stage_finetune(rows)
+        return
+
+    # --tiles: per-tile classification (Option E)
+    if args.tiles:
+        if not INVENTORY_CSV.exists():
+            print("ERROR: No cached inventory. Run full pipeline first.")
+            sys.exit(1)
+        with open(INVENTORY_CSV) as f:
+            rows = list(csv.DictReader(f))
+        stage_tiles(rows)
+        return
+
+    # --clip: CLIP features (Option J)
+    if args.clip:
+        if not INVENTORY_CSV.exists():
+            print("ERROR: No cached inventory. Run full pipeline first.")
+            sys.exit(1)
+        with open(INVENTORY_CSV) as f:
+            rows = list(csv.DictReader(f))
+        stage_clip(rows)
         return
 
     # --probe: load cached embeddings, run probe, exit

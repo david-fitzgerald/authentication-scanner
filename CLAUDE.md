@@ -40,7 +40,7 @@ AI-driven art authentication via DINOv2 embeddings. Collection-scale screening �
 
 ## Status
 
-**Best result: 63.7% balanced accuracy (entropy SVM RBF, frozen features).** Fine-tuning (Option I) didn't help — 60.0% ± 5.0%, overfits on N=568. Concat (K) also below entropy alone. Rembrandt-only data is exhausted. Next: multi-artist transfer learning (Tier 3) or pivot to "wrong artist" detector (Option N).
+**Best result: 63.7% balanced accuracy (entropy SVM RBF, frozen features).** All Tier 1 options exhausted (I/E/J/K/C/D). None breaks 64%. Frozen-feature ceiling confirmed. Next: Tier 2 (diagnostic regions, metadata hybrid) or Tier 3 (multi-artist transfer learning) or pivot to "wrong artist" detector (Option N).
 
 ## Decisions Log
 
@@ -61,6 +61,9 @@ AI-driven art authentication via DINOv2 embeddings. Collection-scale screening �
 | 2026-03-02 | C/D re-run on expanded data | ViT-L: 59.5% (no gain). Entropy: **63.7%** — best frozen-feature probe. Entropy worst unsupervised but best supervised. |
 | 2026-03-02 | K: Concat embeddings | 62.3% — diluted entropy signal. PCA too aggressive on 5120d. |
 | 2026-03-03 | I: Fine-tune eliminated | 60.0% ± 5.0% — overfits by epoch 10, doesn't beat frozen entropy (63.7%). N=568 too small for 14M params. |
+| 2026-03-03 | E: Per-tile classification eliminated | 60.2% vote bal acc — tile labels too noisy, majority voting can't recover signal. |
+| 2026-03-03 | J: CLIP ViT-L/14 eliminated | 62.9% bal acc — different foundation model, similar result. Overlapping style info. |
+| 2026-03-03 | **Tier 1 exhausted** | All frozen-feature options (C/D/E/I/J/K) converge at ~59–64%. Ceiling is 63.7% (entropy SVM RBF). |
 
 ## Conventions
 
