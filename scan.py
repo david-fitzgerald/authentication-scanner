@@ -1923,7 +1923,7 @@ def stage_finetune(rows):
     from sklearn.model_selection import StratifiedKFold
     from sklearn.metrics import balanced_accuracy_score
 
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
     print(f"\n[Fine-tune] Device: {device}")
 
     # Filter to autograph + circle
@@ -2148,7 +2148,7 @@ def stage_tiles(rows):
         artist_groups = data["artist_groups"]
     else:
         # Re-embed, saving per-tile features
-        device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+        device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
         print(f"[Tiles] Embedding per-tile features on {device}...")
 
         dino_transform = transforms.Compose([
@@ -2343,7 +2343,7 @@ def stage_clip(rows):
     else:
         import open_clip
 
-        device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+        device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
         print(f"[CLIP] Device: {device}")
         print("[CLIP] Loading CLIP ViT-L/14...")
         model, _, preprocess = open_clip.create_model_and_transforms("ViT-L-14", pretrained="openai")
@@ -2701,7 +2701,7 @@ def stage_lora(rows, label="Rembrandt", results_file=None):
     if results_file is None:
         results_file = RESULTS_LORA_JSON
 
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
     print(f"\n[LoRA {label}] Device: {device}")
 
     # Filter to autograph + circle
@@ -2837,7 +2837,9 @@ def stage_lora(rows, label="Rembrandt", results_file=None):
             "best_epoch": best_epoch,
         })
         del model
-        if torch.backends.mps.is_available():
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        elif torch.backends.mps.is_available():
             torch.mps.empty_cache()
 
     accs = [r["best_val_bal_acc"] for r in fold_results]
@@ -2898,7 +2900,7 @@ def stage_lora_transfer(rows):
     from sklearn.model_selection import StratifiedKFold
     from sklearn.metrics import balanced_accuracy_score
 
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
     print(f"\n[Exp C] LoRA leave-artist-out. Device: {device}")
 
     # Filter to autograph + circle, resolve images
@@ -3014,7 +3016,9 @@ def stage_lora_transfer(rows):
                     break
 
         del model
-        if torch.backends.mps.is_available():
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        elif torch.backends.mps.is_available():
             torch.mps.empty_cache()
         print(f"    {fold_label}: {best_val_bal_acc:.3f} (epoch {best_epoch})")
         return best_val_bal_acc
@@ -3080,7 +3084,7 @@ def stage_lora_curriculum(transfer_rows, rembrandt_rows):
     from sklearn.model_selection import StratifiedKFold
     from sklearn.metrics import balanced_accuracy_score
 
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
     print(f"\n[Exp D] Two-phase LoRA curriculum. Device: {device}")
 
     # Phase 1 data: non-Rembrandt transfer artists
@@ -3212,7 +3216,9 @@ def stage_lora_curriculum(transfer_rows, rembrandt_rows):
     torch.save({k: v for k, v in model.state_dict().items()}, phase1_weights_path)
     print(f"  Phase 1 complete. Saved weights → {phase1_weights_path}")
     del model, optimizer, scheduler
-    if torch.backends.mps.is_available():
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    elif torch.backends.mps.is_available():
         torch.mps.empty_cache()
 
     # --- Phase 2: Fine-tune on Rembrandt (5-fold CV) ---
@@ -3297,7 +3303,9 @@ def stage_lora_curriculum(transfer_rows, rembrandt_rows):
             "best_epoch": best_epoch,
         })
         del model
-        if torch.backends.mps.is_available():
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        elif torch.backends.mps.is_available():
             torch.mps.empty_cache()
 
     accs = [r["best_val_bal_acc"] for r in fold_results]
