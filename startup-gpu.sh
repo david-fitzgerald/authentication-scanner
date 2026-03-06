@@ -59,7 +59,7 @@ echo "[GCS] Download complete."
 # --- Install dependencies ---
 echo ""
 echo "[DEPS] Installing Python packages..."
-pip install peft scikit-learn Pillow 2>&1 | tail -5
+pip install peft scikit-learn Pillow imagehash 2>&1 | tail -5
 echo "[DEPS] Done."
 
 # --- Verify CUDA ---
@@ -76,8 +76,7 @@ echo "========================================"
 echo "  Starting experiments — $(date -u '+%H:%M:%S UTC')"
 echo "========================================"
 
-# Experiment 0: SKIPPED (already done — 5,859 paintings embedded)
-# Experiment B: SKIPPED (already done — 60.9% ± 3.5%)
+# --- Tier 3 experiments (re-run C/D/A) ---
 
 # Experiment C: LoRA leave-artist-out (~30-45min)
 echo ""
@@ -96,6 +95,32 @@ echo ""
 echo "[EXP A] Frozen transfer probe..."
 python3 scan.py --transfer-probe 2>&1
 echo "[EXP A] Done — $(date -u '+%H:%M:%S UTC')"
+
+# --- Methodological re-evaluation (nested CV, strict labels) ---
+
+# Re-run probe with nested CV (new methodology)
+echo ""
+echo "[PROBE] Nested CV probe (entropy, methodological fix)..."
+python3 scan.py --probe --entropy 2>&1
+echo "[PROBE] Nested CV done — $(date -u '+%H:%M:%S UTC')"
+
+# Also run with strict labels for comparison
+echo ""
+echo "[PROBE-STRICT] Nested CV probe with strict labels..."
+python3 scan.py --probe --entropy --strict-labels 2>&1
+echo "[PROBE-STRICT] Done — $(date -u '+%H:%M:%S UTC')"
+
+# Legacy CV for comparison
+echo ""
+echo "[PROBE-LEGACY] Legacy CV probe (for comparison)..."
+python3 scan.py --probe --entropy --legacy-cv 2>&1
+echo "[PROBE-LEGACY] Done — $(date -u '+%H:%M:%S UTC')"
+
+# Institution holdout: Met
+echo ""
+echo "[HOLDOUT-MET] Institution holdout (Met)..."
+python3 scan.py --probe --entropy --holdout-source met 2>&1
+echo "[HOLDOUT-MET] Done — $(date -u '+%H:%M:%S UTC')"
 
 echo ""
 echo "========================================"
