@@ -16,7 +16,6 @@ Usage:
 import argparse
 import csv
 import json
-import os
 import re
 import sys
 import time
@@ -1114,7 +1113,7 @@ def _print_transfer_summary(rows):
     """Print transfer inventory breakdown by artist."""
     from collections import Counter
     artists = Counter(r["artist"] for r in rows)
-    print(f"\n  By artist:")
+    print("\n  By artist:")
     for artist in sorted(artists):
         artist_rows = [r for r in rows if r["artist"] == artist]
         n_auto = sum(1 for r in artist_rows if r["artist_group"].endswith("_autograph"))
@@ -1671,7 +1670,7 @@ def stage5_comparison(metrics, hires=False, model_name="vitb14", entropy=False):
             old = json.load(f)
         model_suffix = " ViT-L/14" if model_name == "vitl14" else " ViT-B/14"
         old_label = f"v1{model_suffix} (mean)"
-        new_label = f"v1-D Entropy-weighted"
+        new_label = "v1-D Entropy-weighted"
     elif model_name == "vitl14" and RESULTS_JSON.exists():
         with open(RESULTS_JSON) as f:
             old = json.load(f)
@@ -1760,7 +1759,7 @@ def stage4b_probe(full_embeddings, artist_groups, painting_ids, rows):
     mask = np.array([(g in ("rembrandt_autograph", "rembrandt_circle")) for g in artist_groups])
     X = full_embeddings[mask]
     y = np.array([1 if g == "rembrandt_autograph" else 0 for g in artist_groups[mask]])
-    ids = painting_ids[mask]
+    _ids = painting_ids[mask]
     n = len(y)
     n_auto = int(y.sum())
     n_circle = n - n_auto
@@ -1838,7 +1837,7 @@ def stage4b_probe(full_embeddings, artist_groups, painting_ids, rows):
             overall_best = (clf_name, best_dims, param_name, best_param, make_clf)
 
     # Comparison table
-    print(f"  COMPARISON")
+    print("  COMPARISON")
     print(f"  {'Classifier':<14} {'Best PCA':<10} {'Best param':<14} {cv_label + ' acc':<10}")
     print(f"  {'-'*14} {'-'*10} {'-'*14} {'-'*10}")
     for r in all_results:
@@ -2093,16 +2092,16 @@ def stage_finetune(rows):
     std_acc = np.std(accs)
 
     print(f"\n{'='*60}")
-    print(f"  FINE-TUNE RESULTS (Option I)")
+    print("  FINE-TUNE RESULTS (Option I)")
     print(f"{'='*60}")
-    print(f"  Model:            DINOv2 ViT-B/14 (last 2 blocks unfrozen)")
-    print(f"  Image size:       518×518")
+    print("  Model:            DINOv2 ViT-B/14 (last 2 blocks unfrozen)")
+    print("  Image size:       518×518")
     print(f"  N autograph:      {n_auto}")
     print(f"  N circle:         {n_circle}")
-    print(f"  CV:               5-fold stratified")
+    print("  CV:               5-fold stratified")
     print(f"  Folds:            {', '.join(f'{a:.3f}' for a in accs)}")
     print(f"  Mean bal acc:     {mean_acc:.3f} ± {std_acc:.3f}")
-    print(f"  vs frozen best:   63.7% (entropy SVM RBF)")
+    print("  vs frozen best:   63.7% (entropy SVM RBF)")
     print(f"{'='*60}")
 
     results = {
@@ -2300,7 +2299,7 @@ def stage_tiles(rows):
     null_std = null_accs.std()
 
     print(f"\n{'='*60}")
-    print(f"  TILE PROBE RESULTS (Option E)")
+    print("  TILE PROBE RESULTS (Option E)")
     print(f"{'='*60}")
     print(f"  N paintings:       {n} ({n_auto} auto + {n_circle} circle)")
     print(f"  Total tiles:       {total_tiles}")
@@ -2451,9 +2450,9 @@ def stage_clip(rows):
     null_std = null_accs.std()
 
     print(f"\n{'='*60}")
-    print(f"  CLIP PROBE RESULTS (Option J)")
+    print("  CLIP PROBE RESULTS (Option J)")
     print(f"{'='*60}")
-    print(f"  Model:          CLIP ViT-L/14 (OpenAI)")
+    print("  Model:          CLIP ViT-L/14 (OpenAI)")
     print(f"  N paintings:    {n} ({n_auto} auto + {n_circle} circle)")
     print(f"  Embed dim:      {embeddings.shape[1]}")
     print(f"  Best:           {best_name} PCA={best_dims} C={best_param}")
@@ -2496,7 +2495,7 @@ def stage_transfer_probe(rows):
         sys.exit(1)
 
     data = np.load(EMBEDDINGS_TRANSFER_NPZ, allow_pickle=True)
-    painting_ids = data["painting_ids"]
+    _painting_ids = data["painting_ids"]
     cls_emb = data["cls_embeddings"]
     patch_emb = data["patch_embeddings"]
     artist_groups = data["artist_groups"]
@@ -2515,7 +2514,7 @@ def stage_transfer_probe(rows):
     print(f"  Features: {full_emb.shape[1]}d")
 
     # --- A1: Pooled 10-fold ---
-    print(f"\n  === A1: Pooled 10-fold (all artists) ===")
+    print("\n  === A1: Pooled 10-fold (all artists) ===")
     pca_dims = [10, 20]
     C_values = [0.01, 0.1, 1.0, 10.0]
     skf = StratifiedKFold(n_splits=10, shuffle=True, random_state=42)
@@ -2537,7 +2536,7 @@ def stage_transfer_probe(rows):
     print(f"  A1 best: PCA={best_dims}, C={best_C} → {best_acc:.3f} balanced accuracy")
 
     # --- A2: Leave-artist-out ---
-    print(f"\n  === A2: Leave-artist-out (train 5, test 1) ===")
+    print("\n  === A2: Leave-artist-out (train 5, test 1) ===")
     a2_results = []
     for test_artist in unique_artists:
         test_mask = artists == test_artist
@@ -2568,7 +2567,7 @@ def stage_transfer_probe(rows):
     rembrandt_a2 = next((r["bal_acc"] for r in a2_results if r["artist"] == "rembrandt"), None)
 
     print(f"\n{'='*60}")
-    print(f"  EXPERIMENT A RESULTS")
+    print("  EXPERIMENT A RESULTS")
     print(f"{'='*60}")
     print(f"  A1 pooled 10-fold:       {best_acc:.3f}")
     print(f"  A2 leave-artist-out mean: {mean_a2:.3f}")
@@ -2849,15 +2848,15 @@ def stage_lora(rows, label="Rembrandt", results_file=None):
     print(f"\n{'='*60}")
     print(f"  LORA RESULTS ({label})")
     print(f"{'='*60}")
-    print(f"  Model:            DINOv2 ViT-B/14 + LoRA (last 4 blocks)")
-    print(f"  Image size:       518×518")
+    print("  Model:            DINOv2 ViT-B/14 + LoRA (last 4 blocks)")
+    print("  Image size:       518×518")
     print(f"  N autograph:      {n_auto}")
     print(f"  N circle:         {n_circle}")
-    print(f"  CV:               5-fold stratified")
+    print("  CV:               5-fold stratified")
     print(f"  Folds:            {', '.join(f'{a:.3f}' for a in accs)}")
     print(f"  Mean bal acc:     {mean_acc:.3f} ± {std_acc:.3f}")
-    print(f"  vs frozen best:   63.7% (entropy SVM RBF)")
-    print(f"  vs fine-tune (I): 60.0% ± 5.0%")
+    print("  vs frozen best:   63.7% (entropy SVM RBF)")
+    print("  vs fine-tune (I): 60.0% ± 5.0%")
     print(f"{'='*60}")
 
     results = {
@@ -2897,7 +2896,6 @@ def stage_lora_transfer(rows):
     import torch.nn as nn
     from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
     from torchvision import transforms
-    from sklearn.model_selection import StratifiedKFold
     from sklearn.metrics import balanced_accuracy_score
 
     device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
@@ -3024,7 +3022,7 @@ def stage_lora_transfer(rows):
         return best_val_bal_acc
 
     # --- C2: Leave-artist-out ---
-    print(f"\n  === C2: Leave-artist-out ===")
+    print("\n  === C2: Leave-artist-out ===")
     c2_results = []
     for test_artist in unique_artists:
         test_mask = artists == test_artist
@@ -3048,11 +3046,11 @@ def stage_lora_transfer(rows):
     rembrandt_c2 = next((r["bal_acc"] for r in c2_results if r["artist"] == "rembrandt"), None)
 
     print(f"\n{'='*60}")
-    print(f"  EXPERIMENT C RESULTS")
+    print("  EXPERIMENT C RESULTS")
     print(f"{'='*60}")
     print(f"  C2 leave-artist-out mean: {mean_c2:.3f}")
     print(f"  C2 Rembrandt:             {rembrandt_c2:.3f}" if rembrandt_c2 else "  C2 Rembrandt: N/A")
-    print(f"  vs Exp B (LoRA Rembrandt): compare manually")
+    print("  vs Exp B (LoRA Rembrandt): compare manually")
     print(f"{'='*60}")
 
     results = {
@@ -3156,7 +3154,7 @@ def stage_lora_curriculum(transfer_rows, rembrandt_rows):
             return self.transform(img), self.labels[i]
 
     # --- Phase 1: Pre-train on 5 artists ---
-    print(f"\n  === Phase 1: Pre-train on non-Rembrandt artists ===")
+    print("\n  === Phase 1: Pre-train on non-Rembrandt artists ===")
     phase1_epochs = 30
     phase1_patience = 7
     phase1_lr = 5e-5
@@ -3222,7 +3220,7 @@ def stage_lora_curriculum(transfer_rows, rembrandt_rows):
         torch.mps.empty_cache()
 
     # --- Phase 2: Fine-tune on Rembrandt (5-fold CV) ---
-    print(f"\n  === Phase 2: Fine-tune on Rembrandt (5-fold CV) ===")
+    print("\n  === Phase 2: Fine-tune on Rembrandt (5-fold CV) ===")
     phase2_lr = 1e-5  # Lower LR for fine-tuning
     phase2_epochs = 50
     phase2_patience = 10
@@ -3313,15 +3311,15 @@ def stage_lora_curriculum(transfer_rows, rembrandt_rows):
     std_acc = np.std(accs)
 
     print(f"\n{'='*60}")
-    print(f"  EXPERIMENT D RESULTS (Two-phase LoRA)")
+    print("  EXPERIMENT D RESULTS (Two-phase LoRA)")
     print(f"{'='*60}")
     print(f"  Phase 1: {len(phase1_labels)} non-Rembrandt paintings")
     print(f"  Phase 2: {len(phase2_labels)} Rembrandt paintings")
     print(f"  Phase 2 LR: {phase2_lr}")
     print(f"  Folds:            {', '.join(f'{a:.3f}' for a in accs)}")
     print(f"  Mean bal acc:     {mean_acc:.3f} ± {std_acc:.3f}")
-    print(f"  vs Exp B (LoRA):  compare manually")
-    print(f"  vs frozen best:   63.7% (entropy SVM RBF)")
+    print("  vs Exp B (LoRA):  compare manually")
+    print("  vs frozen best:   63.7% (entropy SVM RBF)")
     print(f"{'='*60}")
 
     results = {

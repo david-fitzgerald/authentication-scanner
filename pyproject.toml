@@ -1,0 +1,41 @@
+[project]
+name = "authentication-scanner"
+version = "0.3.1"
+description = "AI-driven art authentication via DINOv2 embeddings"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "requests",
+    "Pillow",
+]
+
+[project.optional-dependencies]
+ml = [
+    "torch",
+    "torchvision",
+    "scikit-learn",
+    "peft",
+    "umap-learn",
+    "scipy",
+    "matplotlib",
+    "open-clip-torch",
+]
+dev = [
+    "ruff",
+    "pytest",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+extend-exclude = ["*.ipynb"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = [
+    "E501",   # line length — research script, not enforcing strictly
+    "E741",   # ambiguous variable names (l, I, O) — common in ML code
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

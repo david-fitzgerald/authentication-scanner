@@ -1,8 +1,8 @@
 ---
-version: 0.3.0
+version: 0.3.1
 status: building
-harness: L0
-updated: 2026-03-03
+harness: L1
+updated: 2026-03-05
 ---
 
 # Authentication — Claude Instructions
@@ -27,7 +27,7 @@ AI-driven art authentication via DINOv2 embeddings. Collection-scale screening �
 
 ## Environment
 
-- **Compute:** MPS (local), Google Colab Pro (T4 GPUs)
+- **Compute:** MPS (local), GCE on-demand T4 (deploy-gpu.sh + startup-gpu.sh, europe-west4-a)
 - **Data:** Rijksmuseum APIs, Met Open Access, Wikidata SPARQL, NGA/CMA/AIC APIs. All free, no API keys.
 - **Storage:** Three-tier cache: metadata → images → embeddings (~1.5 GB for prototype)
 - **Repo:** Private GitHub: `david-fitzgerald/authentication-scanner`
@@ -36,7 +36,9 @@ AI-driven art authentication via DINOv2 embeddings. Collection-scale screening �
 
 | File | What |
 |------|------|
-| `scan.py` | Local pipeline. Rijksmuseum + Met + Wikidata SPARQL + museum APIs. Three-tier cache (metadata→images→embeddings). MPS device. |
+| `scan.py` | Local pipeline. Rijksmuseum + Met + Wikidata SPARQL + museum APIs. Three-tier cache (metadata→images→embeddings). CUDA/MPS/CPU auto-detect. |
+| `deploy-gpu.sh` | GCE Spot T4 launcher. Creates VM, uploads cache, runs experiments, self-destructs. |
+| `startup-gpu.sh` | VM startup script. Installs deps, runs experiments, uploads results to GCS. |
 | `prototype.ipynb` | Phase 1 prototype. DINOv2 embedding pipeline on Rijksmuseum Rembrandt corpus. Run on Colab Pro (T4). |
 | `scan-results.md` | Local pipeline results. v1 vs v2 comparison, key findings, next steps (C/D/E/F). |
 | `prototype-results.md` | Colab prototype results. Original Rijksmuseum-only metrics + API discoveries. |
@@ -71,11 +73,41 @@ AI-driven art authentication via DINOv2 embeddings. Collection-scale screening �
 | 2026-03-03 | J: CLIP ViT-L/14 eliminated | 62.9% bal acc — different foundation model, similar result. Overlapping style info. |
 | 2026-03-03 | **Tier 1 exhausted** | All frozen-feature options (C/D/E/I/J/K) converge at ~59–64%. Ceiling is 63.7% (entropy SVM RBF). |
 | 2026-03-03 | Tier 3: Multi-artist transfer + LoRA | 6 artists (Rubens, Cranach, Van Dyck, Titian, Hals, Rembrandt). 4 experiments: A (frozen probe), B (LoRA Rembrandt), C (LoRA leave-artist-out), D (curriculum transfer). peft installed. |
+| 2026-03-05 | GCE Spot T4 deployed | scan.py CUDA-portable (10 edits). deploy-gpu.sh + startup-gpu.sh created. Transfer corpus: 5,859 paintings embedded. |
+| 2026-03-05 | EXP B (LoRA Rembrandt): 60.9% ± 3.5% | Worse than frozen entropy (63.7%). LoRA with 148K params didn't help. |
+| 2026-03-06 | EXP C crashed (CUDA error) | Cranach fold only (53.4%). Spot VM preempted on retry. Redeployed on-demand `europe-west4-a`. |
+
+## Verification
+
+```bash
+ruff check . && pytest tests/ -x -q --tb=short
+```
 
 ## Conventions
 
 - Never say "authenticate" — always "screen and flag for expert review"
 - Business/research context in `research.md`, `business-plan.md`, `execution.md`
+
+## Next Session
+
+**Tier 3 experiments C/D/A running on GCE on-demand T4** (`auth-experiments`, `europe-west4-a`).
+VM started ~Mar 6 afternoon UTC, 36h cap. On-demand (Spot kept getting preempted/exhausted in US zones).
+`CUDA_LAUNCH_BLOCKING=1` set to prevent async CUDA errors that crashed EXP C on the first run.
+
+### Results so far
+- **EXP 0** (transfer embed): Done. 5,859 paintings embedded.
+- **EXP B** (LoRA Rembrandt): **60.9% ± 3.5%** — worse than frozen entropy (63.7%). LoRA didn't help.
+- **EXP C** (LoRA leave-artist-out): Running (crashed first attempt at cranach fold: 53.4%, CUDA error).
+- **EXP D** (two-phase curriculum): Queued after C.
+- **EXP A** (frozen transfer probe): Queued after D. Fast (~5min).
+
+### Check results
+1. Check VM: `gcloud compute instances describe auth-experiments --zone=europe-west4-a --project=perpstrader --format='value(status)' 2>&1`
+2. SSH monitor: `gcloud compute ssh auth-experiments --zone=europe-west4-a -- tail -50 /var/log/auth-experiments.log`
+3. Check GCS results: `gsutil ls gs://auth-ml-cache/results/`
+4. Pull results: `gsutil -m rsync -r gs://auth-ml-cache/results/ cache/`
+5. Emergency stop: `gcloud compute instances delete auth-experiments --zone=europe-west4-a --quiet`
+6. Analyze results, write up in scan-results.md
 
 ---
 Screen and flag, never authenticate. No API keys needed.
