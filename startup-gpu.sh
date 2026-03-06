@@ -69,23 +69,15 @@ python3 -c "import torch; print(f'[CUDA] PyTorch {torch.__version__}, CUDA: {tor
 # --- Run experiments ---
 cd "${WORK}"
 RESULTS_DIR="${WORK}/cache"
+export CUDA_LAUNCH_BLOCKING=1
 
 echo ""
 echo "========================================"
 echo "  Starting experiments — $(date -u '+%H:%M:%S UTC')"
 echo "========================================"
 
-# Experiment 0: Transfer corpus (fetch 6K paintings + embed, ~30min)
-echo ""
-echo "[EXP 0] Transfer corpus..."
-python3 scan.py --corpus transfer 2>&1
-echo "[EXP 0] Done — $(date -u '+%H:%M:%S UTC')"
-
-# Experiment B: LoRA Rembrandt-only (~15-20min)
-echo ""
-echo "[EXP B] LoRA Rembrandt-only..."
-python3 scan.py --lora 2>&1
-echo "[EXP B] Done — $(date -u '+%H:%M:%S UTC')"
+# Experiment 0: SKIPPED (already done — 5,859 paintings embedded)
+# Experiment B: SKIPPED (already done — 60.9% ± 3.5%)
 
 # Experiment C: LoRA leave-artist-out (~30-45min)
 echo ""

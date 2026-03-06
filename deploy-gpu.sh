@@ -4,7 +4,7 @@
 set -euo pipefail
 
 PROJECT="${GCP_PROJECT:?Set GCP_PROJECT}"
-ZONE="us-central1-a"
+ZONE="europe-west4-a"
 INSTANCE="auth-experiments"
 BUCKET="${GCS_BUCKET:?Set GCS_BUCKET}"
 MACHINE_TYPE="n1-standard-4"
@@ -12,7 +12,7 @@ ACCELERATOR="type=nvidia-tesla-t4,count=1"
 IMAGE_FAMILY="pytorch-2-7-cu128-ubuntu-2204-nvidia-570"
 IMAGE_PROJECT="deeplearning-platform-release"
 BOOT_DISK_SIZE="100GB"
-MAX_RUN="14400s"  # 4h hard cap
+MAX_RUN="129600s"  # 36h hard cap
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CACHE_DIR="${SCRIPT_DIR}/cache"
@@ -98,7 +98,7 @@ gcloud compute instances create "${INSTANCE}" \
     --machine-type="${MACHINE_TYPE}" \
     --accelerator="${ACCELERATOR}" \
     --maintenance-policy=TERMINATE \
-    --provisioning-model=SPOT \
+    --provisioning-model=STANDARD \
     --instance-termination-action=DELETE \
     --max-run-duration="${MAX_RUN}" \
     --image-family="${IMAGE_FAMILY}" \

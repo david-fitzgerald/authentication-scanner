@@ -589,3 +589,99 @@ Exp B is independent of the transfer corpus — can run immediately on existing 
 ### Results
 
 *Not yet run. Results will be added here as experiments complete.*
+
+### Post-Tier 3 Diagnostic: Separability by Attribution Type
+
+**Question:** Does the data match the theoretical hierarchy of master involvement?
+
+**Theoretical hierarchy (most → least master involvement):**
+```
+autograph > workshop > circle > pupil > school > style/manner
+hardest to separate ←――――――――――――――――→ easiest to separate
+```
+
+**What our Rembrandt corpus shows (N=108, v1 ViT-B):**
+
+| Group | Sim to Autograph | MW p-value | Verdict |
+|-------|-----------------|------------|---------|
+| Circle | 0.8478 | 0.805 | Indistinguishable |
+| Pupil | 0.8118 | 2.03e-11 | Easy to separate |
+| Other Dutch | 0.8165 | 3.40e-10 | Easy to separate |
+
+**Partial contradiction of theory.** Circle is hardest — matches. But pupil ≈ other Dutch in difficulty, when pupil should be harder. DINOv2 is detecting "different artist" (different person = different brushwork), not "quality level" (master involvement). Circle paintings are indistinguishable because that's the definition — unidentified person painting convincingly in the master's style.
+
+**Key gap:** Workshop separability is unknown. Our Rembrandt corpus lumps workshop into circle. The transfer corpus (5,860 paintings) has workshop as a separate label (N=468) but we haven't run similarity analysis on it yet.
+
+**Diagnostic to run post-Tier 3:** Using the transfer corpus embeddings, compute per-attribution-type similarity to autograph centroid and MW p-values for each of the 5 non-autograph categories (workshop, circle, school, style, pupil where available), broken down by artist. Tests whether:
+1. Workshop is harder to separate than circle (theory predicts yes)
+2. School/style are easiest (theory predicts yes)
+3. The difficulty hierarchy is consistent across artists or artist-specific
+
+**Transfer corpus attribution counts:**
+
+|  | autograph | workshop | circle | school | style | total |
+|--|----------:|---------:|-------:|-------:|------:|------:|
+| cranach | 823 | 172 | 18 | 11 | 29 | 1,053 |
+| hals | 284 | 11 | 39 | 1 | 48 | 383 |
+| rembrandt | 675 | 38 | 17 | 13 | 78 | 821 |
+| rubens | 1,559 | 106 | 15 | 19 | 32 | 1,731 |
+| titian | 366 | 72 | 5 | 10 | 16 | 469 |
+| vandyck | 1,264 | 69 | 14 | 10 | 46 | 1,403 |
+| **TOTAL** | **4,971** | **468** | **108** | **64** | **249** | **5,860** |
+
+## Tier 4: Cross-Domain Transfer Learning (If Tier 3 Caps Out)
+
+### Hypothesis
+
+The core signal we're learning isn't "what does a Rembrandt look like" — it's "created vs reproduced." Stroke confidence, compositional decisiveness, detail quality gradients. That signal should exist wherever masters had workshops. Our 6 European Old Masters may be too narrow a domain to learn it robustly. Training on authentication data from other artistic traditions could provide the volume and diversity needed.
+
+### High-Overlap Domains (same visual signals, similar workshop dynamics)
+
+| Domain | Dataset potential | Label quality | Why it transfers |
+|--------|-----------------|---------------|-----------------|
+| **Chinese scroll painting** | Enormous. Palace Museum + Taipei NPM have millions of works. Forgery is a 1000+ year tradition. Qi Baishi alone has est. 100K+ fakes in circulation. | Excellent. Centuries of scholarly cataloguing. | Same dynamic: master vs student/copyist. Chinese connoisseurship literally uses "bone method" (骨法用筆) — judging authenticity by stroke structure. That's what we're asking DINOv2 to learn. |
+| **Old Master drawings** | Tens of thousands across institutions. | Good. Less commercially valuable than paintings so less contested attribution. | Purer signal. No paint layers obscuring the stroke. Pen/chalk on paper = raw brushwork confidence. |
+| **Prints & engravings** | Massive. Rembrandt alone has ~300 etching plates, each with lifetime vs posthumous impressions. | Very good. Print states are well-documented. | Quality degradation is measurable. Early impressions vs worn plates = genuine "confidence" gradient. |
+| **Manuscript illumination** | Large. Medieval/Renaissance workshops extensively catalogued. | Moderate. Attribution is active research. | Literal workshop production line — master does faces, assistants do borders. Exactly our signal. |
+
+### Adjacent Domains (different medium, overlapping underlying pattern)
+
+| Domain | Transferable signal | Dataset size | Practicality |
+|--------|-------------------|-------------|-------------|
+| Signature verification | Stroke confidence, hesitation detection | Millions of samples. Well-studied ML problem. | High — public datasets exist (CEDAR, GPDS) |
+| Handwriting forensics | Authorial consistency, production fluency | Large forensic datasets | Moderate — restricted access |
+| Calligraphy authentication | Brush dynamics, spacing rhythm | Huge in East Asian scholarship | Moderate — digitization varies |
+
+### Why Chinese Painting May Be the Biggest Unlock
+
+1. **Scale.** Orders of magnitude more labeled data than European Old Masters. Institutional digitization is accelerating.
+2. **Same signal.** "Bone method" in Chinese connoisseurship = stroke-level authenticity judgment. Directly overlaps with what DINOv2 entropy-weighting captures (high-variance tiles = brushwork detail).
+3. **Existing scholarship.** Palace Museum (Beijing) and National Palace Museum (Taipei) have extensive digital collections with attribution metadata. Wikidata coverage of Chinese art is growing.
+4. **Different enough to prove generalization.** If a model trained on Song dynasty scrolls helps authenticate Rembrandt, that's a paper and a product — evidence that "created vs reproduced" is a universal visual signal.
+
+### Training Strategy
+
+1. **Cross-domain pre-train → European fine-tune.** LoRA pre-trained on Chinese/Japanese painting authentication data, then fine-tuned on our 6 European masters. If "workshop-ness" is universal, this could break the 63.7% ceiling by learning the general pattern from a much larger dataset.
+2. **Multi-domain pooling.** Train a single binary classifier on all available authentication data across traditions. Tests whether the signal is truly domain-agnostic.
+3. **Domain-adversarial training.** Force the model to learn authentication features that are *invariant* to artistic tradition. Penalize the model for being able to predict which tradition a painting comes from while still predicting autograph vs workshop.
+
+### Data Sources to Investigate
+
+| Source | What | Access |
+|--------|------|--------|
+| Palace Museum (Beijing) digital collection | Chinese painting with attribution metadata | Public API, needs investigation |
+| National Palace Museum (Taipei) Open Data | Curated masterworks with scholarly attribution | Public, structured metadata |
+| Wikidata P170 + qualifiers for Chinese artists | Same SPARQL approach as our existing pipeline | Free, our infra already supports this |
+| Met Asian Art department | Chinese/Japanese paintings with attribution | Already using Met API |
+| British Museum collection online | Prints, drawings, Asian art | Public API |
+| CEDAR signature dataset | Genuine vs forged signatures | Academic access |
+
+### Prerequisites
+
+- Tier 3 results first. If LoRA + 6 European artists breaks 70%, cross-domain may be unnecessary.
+- Scoping study: Wikidata SPARQL query for Chinese master painters with workshop qualifiers. How many labeled paintings exist?
+- Image availability check: do these sources have IIIF or downloadable images at sufficient resolution?
+
+### Success Criteria
+
+Beat Tier 3 best on Rembrandt balanced accuracy using cross-domain pre-training. >75% = strong validation of universal authenticity signal. Would be a novel research contribution — no published work on cross-tradition transfer for authentication.
