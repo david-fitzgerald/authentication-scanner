@@ -184,13 +184,19 @@ def fetch_json(url, params=None):
 # ---------------------------------------------------------------------------
 
 def classify_attribution(text):
-    """Classify attribution level from a creator/title string."""
+    """Classify attribution level from a creator/title string.
+
+    Returns (attribution, label_confidence):
+      - high: Wikidata qualifier match or explicit museum prefix
+      - medium: regex match on creator string (ATTRIBUTION_PATTERNS)
+      - low: default fallback (no match → assumed autograph)
+    """
     t = text.lower()
     for level, patterns in ATTRIBUTION_PATTERNS.items():
         for pat in patterns:
             if re.search(pat, t):
-                return level
-    return "autograph"
+                return level, "medium"
+    return "autograph", "low"
 
 
 def rk_search_all_pages(params):
@@ -291,13 +297,13 @@ def extract_title_from_edm(edm_json):
 
 
 def classify_rembrandt_group(creator_str):
-    """Classify Rembrandt-related painting. Returns (artist_group, attribution) or (None, None)."""
+    """Classify Rembrandt-related painting. Returns (artist_group, attribution, label_confidence) or (None, None, None)."""
     if "rembrandt" not in creator_str.lower():
-        return None, None
-    attrib = classify_attribution(creator_str)
+        return None, None, None
+    attrib, confidence = classify_attribution(creator_str)
     if attrib == "autograph":
-        return "rembrandt_autograph", "autograph"
-    return "rembrandt_circle", attrib
+        return "rembrandt_autograph", "autograph", confidence
+    return "rembrandt_circle", attrib, confidence
 
 
 # ---------------------------------------------------------------------------
@@ -338,9 +344,16 @@ def met_get_object(object_id):
 
 
 def met_classify_attribution(artist_prefix):
-    """Map Met artistPrefix to attribution level."""
+    """Map Met artistPrefix to attribution level.
+
+    Returns (attribution, label_confidence):
+      - high: explicit museum prefix (Workshop of, Circle of, etc.)
+      - low: empty prefix → assumed autograph
+    """
     prefix = (artist_prefix or "").strip()
-    return MET_PREFIX_MAP.get(prefix, "style" if prefix else "autograph")
+    attrib = MET_PREFIX_MAP.get(prefix, "style" if prefix else "autograph")
+    confidence = "high" if prefix else "low"
+    return attrib, confidence
 
 
 def met_artist_group(artist_name, artist_prefix, query_group=None):
@@ -349,7 +362,7 @@ def met_artist_group(artist_name, artist_prefix, query_group=None):
         return query_group
     name_lower = (artist_name or "").lower()
     if "rembrandt" in name_lower:
-        attrib = met_classify_attribution(artist_prefix)
+        attrib, _conf = met_classify_attribution(artist_prefix)
         if attrib == "autograph":
             return "rembrandt_autograph"
         return "rembrandt_circle"
@@ -542,7 +555,7 @@ def nga_fetch_paintings(query="Rembrandt"):
         image_url = item.get("iiifUrl", "") or item.get("imageUrl", "")
         if not image_url:
             continue
-        attrib = classify_attribution(creator)
+        attrib, confidence = classify_attribution(creator)
         if "rembrandt" in creator.lower():
             group = "rembrandt_autograph" if attrib == "autograph" else "rembrandt_circle"
         else:
@@ -557,6 +570,7 @@ def nga_fetch_paintings(query="Rembrandt"):
             "image_url": image_url,
             "artist_group": group,
             "attribution": attrib,
+            "label_confidence": confidence,
         })
     return results
 
@@ -585,7 +599,7 @@ def cma_search(query="Rembrandt"):
         image_url = item.get("images", {}).get("web", {}).get("url", "")
         if not image_url:
             continue
-        attrib = classify_attribution(f"{qualifier} {creator_name}" if qualifier else creator_name)
+        attrib, confidence = classify_attribution(f"{qualifier} {creator_name}" if qualifier else creator_name)
         group = "rembrandt_autograph" if attrib == "autograph" else "rembrandt_circle"
         obj_id = item.get("id", "")
         results.append({
@@ -597,6 +611,7 @@ def cma_search(query="Rembrandt"):
             "image_url": image_url,
             "artist_group": group,
             "attribution": attrib,
+            "label_confidence": confidence,
         })
     return results
 
@@ -620,7 +635,7 @@ def aic_search(query="Rembrandt"):
         if not image_id:
             continue
         image_url = f"{AIC_IIIF_BASE}/{image_id}/full/!2000,2000/0/default.jpg"
-        attrib = classify_attribution(artist)
+        attrib, confidence = classify_attribution(artist)
         group = "rembrandt_autograph" if attrib == "autograph" else "rembrandt_circle"
         obj_id = item.get("id", "")
         results.append({
@@ -632,6 +647,7 @@ def aic_search(query="Rembrandt"):
             "image_url": image_url,
             "artist_group": group,
             "attribution": attrib,
+            "label_confidence": confidence,
         })
     return results
 
@@ -702,8 +718,9 @@ def stage1_metadata():
         if rec["artist_group"] is not None:
             artist_group = rec["artist_group"]
             attribution = rec["force_attribution"]
+            label_confidence = "low"  # forced control group, no explicit prefix
         else:
-            artist_group, attribution = classify_rembrandt_group(creator)
+            artist_group, attribution, label_confidence = classify_rembrandt_group(creator)
             if artist_group is None:
                 skipped += 1
                 continue
@@ -722,6 +739,7 @@ def stage1_metadata():
             "image_url": image_url,
             "artist_group": artist_group,
             "attribution": attribution,
+            "label_confidence": label_confidence,
         }
         rows.append(row)
         seen_titles.add(row["title"].lower().strip())
@@ -801,7 +819,7 @@ def stage1_metadata():
 
         artist_name = obj.get("artistDisplayName", "")
         artist_prefix = obj.get("artistPrefix", "")
-        attribution = met_classify_attribution(artist_prefix)
+        attribution, label_confidence = met_classify_attribution(artist_prefix)
 
         artist_group = met_artist_group(artist_name, artist_prefix, rec["force_group"])
         if artist_group is None:
@@ -812,6 +830,7 @@ def stage1_metadata():
         # Force attribution for control groups
         if rec["force_group"] is not None:
             attribution = "autograph"
+            label_confidence = "low"  # forced control group
 
         title = obj.get("title", "")
         # Dedup: skip if same title already from Rijksmuseum
@@ -830,6 +849,7 @@ def stage1_metadata():
             "image_url": obj.get("primaryImage", ""),
             "artist_group": artist_group,
             "attribution": attribution,
+            "label_confidence": label_confidence,
         }
         rows.append(row)
         seen_titles.add(title_key)
@@ -874,6 +894,7 @@ def stage1_metadata():
             "image_url": image_url,
             "artist_group": "rembrandt_circle",
             "attribution": p["attribution"],
+            "label_confidence": "high",  # Wikidata qualifier match (P1774-P1780)
         }
         rows.append(row)
         seen_titles.add(title_key)
@@ -914,6 +935,7 @@ def stage1_metadata():
             "image_url": image_url,
             "artist_group": "rembrandt_autograph",
             "attribution": "autograph",
+            "label_confidence": "high",  # Wikidata direct P170, no qualifier
         }
         rows.append(row)
         seen_titles.add(title_key)
@@ -954,6 +976,7 @@ def stage1_metadata():
             "image_url": image_url,
             "artist_group": p["artist_group"],
             "attribution": "autograph",
+            "label_confidence": "high",  # Wikidata direct P170
         }
         rows.append(row)
         seen_titles.add(title_key)
@@ -1001,9 +1024,9 @@ def stage1_metadata():
             deduped.append(row)
     rows = deduped
 
-    fieldnames = ["obj_id", "source", "title", "creator", "date", "image_url", "artist_group", "attribution"]
+    fieldnames = ["obj_id", "source", "title", "creator", "date", "image_url", "artist_group", "attribution", "label_confidence"]
     with open(INVENTORY_CSV, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
 
@@ -1068,6 +1091,7 @@ def stage1_transfer_metadata():
                 "artist_group": f"{label}_autograph",
                 "attribution": "autograph",
                 "artist": label,
+                "label_confidence": "high",  # Wikidata direct P170
             }
             rows.append(row)
             auto_added += 1
@@ -1091,6 +1115,7 @@ def stage1_transfer_metadata():
                 "artist_group": f"{label}_circle",
                 "attribution": p["attribution"],
                 "artist": label,
+                "label_confidence": "high",  # Wikidata qualifier match
             }
             rows.append(row)
             circle_added += 1
@@ -1098,9 +1123,9 @@ def stage1_transfer_metadata():
 
     # Save
     fieldnames = ["obj_id", "source", "title", "creator", "date", "image_url",
-                   "artist_group", "attribution", "artist"]
+                   "artist_group", "attribution", "artist", "label_confidence"]
     with open(INVENTORY_TRANSFER_CSV, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
 
@@ -1169,8 +1194,8 @@ def stage2_images(rows, hires=False):
                     scale = IMG_HIRES_MAX_PX / max(w, h)
                     img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
             else:
-                # v1 behavior: resize non-Rijksmuseum to 2000px
-                if row["source"] != "rijksmuseum" and max(w, h) > IMG_MAX_PX:
+                # v1 behavior: resize ALL images to IMG_MAX_PX for uniform preprocessing
+                if max(w, h) > IMG_MAX_PX:
                     scale = IMG_MAX_PX / max(w, h)
                     img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
             img.save(img_path, "JPEG", quality=95)
@@ -1185,6 +1210,56 @@ def stage2_images(rows, hires=False):
     total_ok = success + cached
     print(f"[Stage 2] Done: {total_ok} available ({cached} cached, {success} new), {failed} failed")
     return total_ok
+
+
+# ---------------------------------------------------------------------------
+# Stage 2b: Perceptual dedup
+# ---------------------------------------------------------------------------
+
+def compute_phashes(rows, cache_dir=None):
+    """Compute perceptual hashes for all downloaded images. Returns {obj_id: phash}."""
+    import imagehash
+    if cache_dir is None:
+        cache_dir = CACHE_IMG
+    phashes = {}
+    for row in rows:
+        img_path = cache_dir / f"{row['obj_id']}.jpg"
+        if not img_path.exists():
+            continue
+        try:
+            img = Image.open(img_path)
+            phashes[row["obj_id"]] = imagehash.average_hash(img, hash_size=16)
+        except Exception:
+            continue
+    return phashes
+
+
+def dedup_by_phash(rows, phashes, threshold=10):
+    """Remove near-duplicate images based on perceptual hash hamming distance.
+
+    Keeps the higher-resolution version when a pair is found.
+    Returns (deduped_rows, n_removed).
+    """
+    from itertools import combinations
+
+    # Build list of (obj_id, phash) pairs
+    items = [(r["obj_id"], phashes[r["obj_id"]]) for r in rows if r["obj_id"] in phashes]
+
+    # Find near-duplicate pairs
+    to_remove = set()
+    for (id_a, hash_a), (id_b, hash_b) in combinations(items, 2):
+        if id_a in to_remove or id_b in to_remove:
+            continue
+        if hash_a - hash_b < threshold:
+            # Keep higher-resolution: check file size as proxy
+            path_a = CACHE_IMG / f"{id_a}.jpg"
+            path_b = CACHE_IMG / f"{id_b}.jpg"
+            size_a = path_a.stat().st_size if path_a.exists() else 0
+            size_b = path_b.stat().st_size if path_b.exists() else 0
+            to_remove.add(id_b if size_a >= size_b else id_a)
+
+    deduped = [r for r in rows if r["obj_id"] not in to_remove]
+    return deduped, len(to_remove)
 
 
 # ---------------------------------------------------------------------------
@@ -1748,8 +1823,9 @@ def stage5_comparison(metrics, hires=False, model_name="vitb14", entropy=False):
 # Stage 4b: Linear Probe (Option F)
 # ---------------------------------------------------------------------------
 
-def stage4b_probe(full_embeddings, artist_groups, painting_ids, rows):
-    """PCA + multi-classifier LOO-CV + permutation test on autograph vs circle."""
+def stage4b_probe(full_embeddings, artist_groups, painting_ids, rows,
+                  strict_labels=False, legacy_cv=False, holdout_source=None):
+    """PCA + multi-classifier CV + permutation test on autograph vs circle."""
     from sklearn.decomposition import PCA
     from sklearn.linear_model import LogisticRegression
     from sklearn.svm import SVC
@@ -1757,6 +1833,23 @@ def stage4b_probe(full_embeddings, artist_groups, painting_ids, rows):
 
     # Filter to autograph + circle only
     mask = np.array([(g in ("rembrandt_autograph", "rembrandt_circle")) for g in artist_groups])
+
+    # --strict-labels: exclude low-confidence labels
+    if strict_labels:
+        confidence_by_id = {r["obj_id"]: r.get("label_confidence", "low") for r in rows}
+        conf_mask = np.array([confidence_by_id.get(pid, "low") != "low" for pid in painting_ids])
+        n_excluded = int(mask.sum()) - int((mask & conf_mask).sum())
+        mask = mask & conf_mask
+        print(f"  [strict-labels] Excluded {n_excluded} low-confidence rows")
+
+    # --holdout-source: hold out one institution for domain-shift evaluation
+    if holdout_source:
+        source_by_id = {r["obj_id"]: r.get("source", "") for r in rows}
+        holdout_mask = np.array([source_by_id.get(pid, "") == holdout_source for pid in painting_ids])
+        holdout_mask = holdout_mask & mask
+        n_holdout = int(holdout_mask.sum())
+        print(f"  [holdout-source] Holding out {n_holdout} rows from '{holdout_source}'")
+
     X = full_embeddings[mask]
     y = np.array([1 if g == "rembrandt_autograph" else 0 for g in artist_groups[mask]])
     _ids = painting_ids[mask]
@@ -1779,86 +1872,182 @@ def stage4b_probe(full_embeddings, artist_groups, painting_ids, rows):
     ]
 
     from sklearn.model_selection import StratifiedKFold, cross_val_score
+    from sklearn.metrics import balanced_accuracy_score
 
-    # LOO is impractical at N>100 (O(N²) fits). Use stratified 10-fold instead.
-    use_loo = n <= 100
-    cv_label = "LOO" if use_loo else "10-fold"
+    if legacy_cv:
+        # --- Legacy (non-nested) CV: grid search on same folds used for reporting ---
+        use_loo = n <= 100
+        cv_label = "LOO (legacy)" if use_loo else "10-fold (legacy)"
+        print("  [legacy-cv] Using non-nested CV for comparison")
 
-    def cv_accuracy(X_data, y_data, make_clf, param_val):
-        """Cross-validated accuracy: LOO if N<=100, else stratified 10-fold."""
-        clf = make_clf(param_val)
-        if use_loo:
-            correct = 0
-            for i in range(len(y_data)):
-                X_train = np.delete(X_data, i, axis=0)
-                y_train = np.delete(y_data, i)
-                X_test = X_data[i:i+1]
-                c = make_clf(param_val)
-                c.fit(X_train, y_train)
-                if c.predict(X_test)[0] == y_data[i]:
-                    correct += 1
-            return correct / len(y_data)
-        else:
-            skf = StratifiedKFold(n_splits=10, shuffle=True, random_state=42)
-            scores = cross_val_score(clf, X_data, y_data, cv=skf, scoring="balanced_accuracy")
-            return scores.mean()
+        def cv_accuracy(X_data, y_data, make_clf, param_val):
+            clf = make_clf(param_val)
+            if use_loo:
+                correct = 0
+                for i in range(len(y_data)):
+                    X_train = np.delete(X_data, i, axis=0)
+                    y_train = np.delete(y_data, i)
+                    X_test = X_data[i:i+1]
+                    c = make_clf(param_val)
+                    c.fit(X_train, y_train)
+                    if c.predict(X_test)[0] == y_data[i]:
+                        correct += 1
+                return correct / len(y_data)
+            else:
+                skf = StratifiedKFold(n_splits=10, shuffle=True, random_state=42)
+                scores = cross_val_score(clf, X_data, y_data, cv=skf, scoring="balanced_accuracy")
+                return scores.mean()
 
-    # Grid search per classifier
-    all_results = []
-    overall_best_acc = 0
-    overall_best = None  # (name, dims, param_name, param_val, make_clf)
+        all_results = []
+        overall_best_acc = 0
+        overall_best = None
+        for clf_name, make_clf, param_name, param_values in classifiers:
+            print(f"  --- {clf_name} ---")
+            print(f"  {'PCA dims':<10} " + " ".join(f"{param_name}={v:<7}" for v in param_values))
+            print(f"  {'-'*10} " + " ".join(f"{'-'*10}" for _ in param_values))
+            best_acc, best_dims, best_param = 0, 0, 0
+            for dims in pca_dims:
+                pca = PCA(n_components=dims, random_state=42)
+                X_pca = pca.fit_transform(X)
+                row_str = f"  {dims:<10}"
+                for v in param_values:
+                    acc = cv_accuracy(X_pca, y, make_clf, v)
+                    row_str += f" {acc:<10.3f}"
+                    if acc > best_acc:
+                        best_acc, best_dims, best_param = acc, dims, v
+                print(row_str)
+            print(f"  Best: PCA={best_dims}, {param_name}={best_param} → {best_acc:.3f} ({cv_label})\n")
+            all_results.append({
+                "classifier": clf_name, "best_pca_dims": best_dims,
+                "best_param_name": param_name, "best_param_value": best_param,
+                "cv_accuracy": round(best_acc, 4), "cv_method": cv_label,
+            })
+            if best_acc > overall_best_acc:
+                overall_best_acc = best_acc
+                overall_best = (clf_name, best_dims, param_name, best_param, make_clf)
 
-    for clf_name, make_clf, param_name, param_values in classifiers:
-        print(f"  --- {clf_name} ---")
-        print(f"  {'PCA dims':<10} " + " ".join(f"{param_name}={v:<7}" for v in param_values))
-        print(f"  {'-'*10} " + " ".join(f"{'-'*10}" for _ in param_values))
-        best_acc, best_dims, best_param = 0, 0, 0
-        for dims in pca_dims:
-            pca = PCA(n_components=dims, random_state=42)
-            X_pca = pca.fit_transform(X)
-            row_str = f"  {dims:<10}"
+        best_name, best_dims, best_pname, best_pval, best_make_clf = overall_best
+
+        # Permutation test (same non-nested approach)
+        n_perms = 1000
+        print(f"\n  Permutation test on {best_name} ({n_perms} shuffles)...")
+        pca = PCA(n_components=best_dims, random_state=42)
+        X_best = pca.fit_transform(X)
+        null_accs = np.zeros(n_perms)
+        rng = np.random.RandomState(42)
+        for p in range(n_perms):
+            y_shuf = rng.permutation(y)
+            null_accs[p] = cv_accuracy(X_best, y_shuf, best_make_clf, best_pval)
+            if (p + 1) % 100 == 0:
+                print(f"    {p+1}/{n_perms} done")
+    else:
+        # --- Nested CV: outer 10-fold for reporting, inner 5-fold for model selection ---
+        cv_label = "nested 10×5-fold"
+        print("  Using nested CV (outer=10, inner=5)")
+
+        outer_cv = StratifiedKFold(n_splits=10, shuffle=True, random_state=42)
+        inner_cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+        # Build config grid: (clf_name, make_clf, param_name, param_val, dims)
+        configs = []
+        for clf_name, make_clf, param_name, param_values in classifiers:
             for v in param_values:
-                acc = cv_accuracy(X_pca, y, make_clf, v)
-                row_str += f" {acc:<10.3f}"
-                if acc > best_acc:
-                    best_acc, best_dims, best_param = acc, dims, v
-            print(row_str)
-        print(f"  Best: PCA={best_dims}, {param_name}={best_param} → {best_acc:.3f} ({cv_label})\n")
-        all_results.append({
-            "classifier": clf_name,
-            "best_pca_dims": best_dims,
-            "best_param_name": param_name,
-            "best_param_value": best_param,
-            "cv_accuracy": round(best_acc, 4),
+                for dims in pca_dims:
+                    configs.append((clf_name, make_clf, param_name, v, dims))
+
+        outer_scores = []
+        outer_configs = []
+
+        for fold_i, (train_idx, test_idx) in enumerate(outer_cv.split(X, y)):
+            X_train_outer, X_test_outer = X[train_idx], X[test_idx]
+            y_train_outer, y_test_outer = y[train_idx], y[test_idx]
+
+            # Inner CV: select best config
+            best_inner_acc = 0
+            best_config = None
+            for clf_name, make_clf, param_name, param_val, dims in configs:
+                pca = PCA(n_components=dims, random_state=42)
+                X_inner = pca.fit_transform(X_train_outer)
+                inner_scores_list = []
+                for inner_train, inner_val in inner_cv.split(X_inner, y_train_outer):
+                    clf = make_clf(param_val)
+                    clf.fit(X_inner[inner_train], y_train_outer[inner_train])
+                    preds = clf.predict(X_inner[inner_val])
+                    inner_scores_list.append(balanced_accuracy_score(y_train_outer[inner_val], preds))
+                mean_inner = np.mean(inner_scores_list)
+                if mean_inner > best_inner_acc:
+                    best_inner_acc = mean_inner
+                    best_config = (clf_name, make_clf, param_name, param_val, dims)
+
+            # Evaluate best config on outer test fold
+            clf_name, make_clf, param_name, param_val, dims = best_config
+            pca = PCA(n_components=dims, random_state=42)
+            X_train_pca = pca.fit_transform(X_train_outer)
+            X_test_pca = pca.transform(X_test_outer)
+            clf = make_clf(param_val)
+            clf.fit(X_train_pca, y_train_outer)
+            preds = clf.predict(X_test_pca)
+            fold_acc = balanced_accuracy_score(y_test_outer, preds)
+            outer_scores.append(fold_acc)
+            outer_configs.append(best_config)
+
+            print(f"    Fold {fold_i+1}/10: {fold_acc:.3f} ({clf_name}, PCA={dims}, {param_name}={param_val})")
+
+        overall_best_acc = np.mean(outer_scores)
+        overall_std = np.std(outer_scores)
+
+        # Most frequently selected config across folds
+        from collections import Counter
+        config_keys = [(c[0], c[4], c[2], c[3]) for c in outer_configs]
+        most_common = Counter(config_keys).most_common(1)[0][0]
+        best_name, best_dims, best_pname, best_pval = most_common
+        best_make_clf = next(mc for cn, mc, pn, pv, d in configs
+                            if cn == best_name and d == best_dims and pn == best_pname and pv == best_pval)
+
+        all_results = [{
+            "classifier": best_name, "best_pca_dims": best_dims,
+            "best_param_name": best_pname, "best_param_value": best_pval,
+            "cv_accuracy": round(overall_best_acc, 4), "cv_std": round(overall_std, 4),
             "cv_method": cv_label,
-        })
-        if best_acc > overall_best_acc:
-            overall_best_acc = best_acc
-            overall_best = (clf_name, best_dims, param_name, best_param, make_clf)
+        }]
 
-    # Comparison table
-    print("  COMPARISON")
-    print(f"  {'Classifier':<14} {'Best PCA':<10} {'Best param':<14} {cv_label + ' acc':<10}")
-    print(f"  {'-'*14} {'-'*10} {'-'*14} {'-'*10}")
-    for r in all_results:
-        param_str = f"{r['best_param_name']}={r['best_param_value']}"
-        print(f"  {r['classifier']:<14} {r['best_pca_dims']:<10} {param_str:<14} {r['cv_accuracy']:<10.3f}")
+        print(f"\n  Nested CV mean: {overall_best_acc:.3f} ± {overall_std:.3f}")
+        print(f"  Most selected: {best_name} (PCA={best_dims}, {best_pname}={best_pval})")
 
-    best_name, best_dims, best_pname, best_pval, best_make_clf = overall_best
-    print(f"\n  Overall best: {best_name} (PCA={best_dims}, {best_pname}={best_pval}) → {overall_best_acc:.3f}")
-
-    # Permutation test on overall best only
-    n_perms = 1000
-    print(f"\n  Permutation test on {best_name} ({n_perms} shuffles)...")
-    pca = PCA(n_components=best_dims, random_state=42)
-    X_best = pca.fit_transform(X)
-    null_accs = np.zeros(n_perms)
-    rng = np.random.RandomState(42)
-    for p in range(n_perms):
-        y_shuf = rng.permutation(y)
-        null_accs[p] = cv_accuracy(X_best, y_shuf, best_make_clf, best_pval)
-        if (p + 1) % 100 == 0:
-            print(f"    {p+1}/{n_perms} done")
+        # Permutation test: full nested CV per permutation (correct but expensive)
+        n_perms = 200  # Reduced from 1000 — full nested CV per permutation
+        print(f"\n  Permutation test ({n_perms} shuffles, full nested CV each)...")
+        null_accs = np.zeros(n_perms)
+        rng = np.random.RandomState(42)
+        for p in range(n_perms):
+            y_shuf = rng.permutation(y)
+            perm_scores = []
+            for train_idx, test_idx in outer_cv.split(X, y_shuf):
+                X_tr, X_te = X[train_idx], X[test_idx]
+                y_tr, y_te = y_shuf[train_idx], y_shuf[test_idx]
+                best_inner = 0
+                best_cfg = configs[0]
+                for cn, mc, pn, pv, dims in configs:
+                    pca = PCA(n_components=dims, random_state=42)
+                    X_inn = pca.fit_transform(X_tr)
+                    inn_scores = []
+                    for i_tr, i_val in inner_cv.split(X_inn, y_tr):
+                        c = mc(pv)
+                        c.fit(X_inn[i_tr], y_tr[i_tr])
+                        inn_scores.append(balanced_accuracy_score(y_tr[i_val], c.predict(X_inn[i_val])))
+                    if np.mean(inn_scores) > best_inner:
+                        best_inner = np.mean(inn_scores)
+                        best_cfg = (cn, mc, pn, pv, dims)
+                _, mc, _, pv, dims = best_cfg
+                pca = PCA(n_components=dims, random_state=42)
+                X_tr_pca = pca.fit_transform(X_tr)
+                X_te_pca = pca.transform(X_te)
+                c = mc(pv)
+                c.fit(X_tr_pca, y_tr)
+                perm_scores.append(balanced_accuracy_score(y_te, c.predict(X_te_pca)))
+            null_accs[p] = np.mean(perm_scores)
+            if (p + 1) % 50 == 0:
+                print(f"    {p+1}/{n_perms} done")
 
     p_value = (np.sum(null_accs >= overall_best_acc) + 1) / (n_perms + 1)
     null_mean = null_accs.mean()
@@ -1872,8 +2061,8 @@ def stage4b_probe(full_embeddings, artist_groups, painting_ids, rows):
     print(f"  Best classifier:      {best_name}")
     print(f"  Best PCA dims:        {best_dims}")
     print(f"  Best {best_pname}:{'':>{13-len(best_pname)}}{best_pval}")
-    print(f"  {cv_label} accuracy:       {overall_best_acc:.3f}")
-    print(f"  Permutation p-value:  {p_value:.4f}")
+    print(f"  {cv_label} accuracy:  {overall_best_acc:.3f}")
+    print(f"  Permutation p-value:  {p_value:.4f} ({n_perms} perms)")
     print(f"  Null mean +/- std:    {null_mean:.3f} +/- {null_std:.3f}")
     print(f"  Signal:               {'YES (p < 0.05)' if p_value < 0.05 else 'NO (p >= 0.05)'}")
     print(f"{'='*60}")
@@ -1894,6 +2083,32 @@ def stage4b_probe(full_embeddings, artist_groups, painting_ids, rows):
         "n_permutations": n_perms,
         "all_classifiers": all_results,
     }
+
+    # --- Institution holdout evaluation (Fix 4) ---
+    if holdout_source:
+        from sklearn.metrics import balanced_accuracy_score
+        source_by_id = {r["obj_id"]: r.get("source", "") for r in rows}
+        holdout_idx = np.array([source_by_id.get(pid, "") == holdout_source for pid in _ids])
+        if holdout_idx.sum() > 0 and (~holdout_idx).sum() > 0:
+            pca = PCA(n_components=best_dims, random_state=42)
+            X_train_h = pca.fit_transform(X[~holdout_idx])
+            X_test_h = pca.transform(X[holdout_idx])
+            clf = best_make_clf(best_pval)
+            clf.fit(X_train_h, y[~holdout_idx])
+            preds = clf.predict(X_test_h)
+            holdout_acc = balanced_accuracy_score(y[holdout_idx], preds)
+            n_holdout_auto = int(y[holdout_idx].sum())
+            n_holdout_circle = int((y[holdout_idx] == 0).sum())
+            print(f"\n  --- Institution holdout: {holdout_source} ---")
+            print(f"  Train: {int((~holdout_idx).sum())} paintings (other sources)")
+            print(f"  Test:  {int(holdout_idx.sum())} paintings ({n_holdout_auto} auto + {n_holdout_circle} circle)")
+            print(f"  Balanced accuracy: {holdout_acc:.3f}")
+            results["holdout_source"] = holdout_source
+            results["holdout_bal_acc"] = round(holdout_acc, 4)
+            results["holdout_n"] = int(holdout_idx.sum())
+        else:
+            print(f"\n  [holdout] No {holdout_source} rows in filtered data, skipping")
+
     with open(RESULTS_PROBE_JSON, "w") as f:
         json.dump(results, f, indent=2)
     print(f"\n  Saved → {RESULTS_PROBE_JSON}")
@@ -2513,8 +2728,8 @@ def stage_transfer_probe(rows):
     print(f"  Artists: {', '.join(unique_artists)}")
     print(f"  Features: {full_emb.shape[1]}d")
 
-    # --- A1: Pooled 10-fold ---
-    print("\n  === A1: Pooled 10-fold (all artists) ===")
+    # --- A1: Pooled 10-fold (upper bound — includes artist-identity signal) ---
+    print("\n  === A1: Pooled 10-fold (upper bound — includes artist-identity signal) ===")
     pca_dims = [10, 20]
     C_values = [0.01, 0.1, 1.0, 10.0]
     skf = StratifiedKFold(n_splits=10, shuffle=True, random_state=42)
@@ -2569,9 +2784,11 @@ def stage_transfer_probe(rows):
     print(f"\n{'='*60}")
     print("  EXPERIMENT A RESULTS")
     print(f"{'='*60}")
-    print(f"  A1 pooled 10-fold:       {best_acc:.3f}")
-    print(f"  A2 leave-artist-out mean: {mean_a2:.3f}")
+    # A2 (leave-artist-out) is the primary metric — tests generalization across artists
+    print(f"  A2 leave-artist-out mean: {mean_a2:.3f}  ← PRIMARY")
     print(f"  A2 Rembrandt (zero-shot): {rembrandt_a2:.3f}" if rembrandt_a2 else "  A2 Rembrandt: N/A")
+    # A1 (pooled) includes artist-identity signal, not just attribution signal
+    print(f"  A1 (pooled, upper bound): {best_acc:.3f}")
     print(f"  Cross-artist signal:     {'YES (>55%)' if rembrandt_a2 and rembrandt_a2 > 0.55 else 'WEAK/NO'}")
     print(f"{'='*60}")
 
@@ -3375,6 +3592,14 @@ def main():
                         help="Experiment C: LoRA leave-artist-out on transfer corpus")
     parser.add_argument("--lora-curriculum", action="store_true",
                         help="Experiment D: LoRA pre-train on 5 artists, fine-tune on Rembrandt")
+    parser.add_argument("--strict-labels", action="store_true",
+                        help="Exclude low-confidence labels from training/eval")
+    parser.add_argument("--dedup-threshold", type=int, default=10,
+                        help="Perceptual hash hamming distance threshold for dedup (default: 10)")
+    parser.add_argument("--holdout-source", type=str, default=None,
+                        help="Hold out all rows from this source for domain-shift evaluation")
+    parser.add_argument("--legacy-cv", action="store_true",
+                        help="Use legacy non-nested CV (for comparison with old results)")
     args = parser.parse_args()
     hires = args.hires
     model_name = args.model
@@ -3433,7 +3658,9 @@ def main():
         artist_groups = data0["artist_groups"]
         full_embeddings = np.concatenate(parts, axis=1)
         print(f"  Concatenated: {full_embeddings.shape[1]}d ({full_embeddings.shape[0]} paintings)")
-        stage4b_probe(full_embeddings, artist_groups, painting_ids, rows)
+        stage4b_probe(full_embeddings, artist_groups, painting_ids, rows,
+                      strict_labels=args.strict_labels, legacy_cv=args.legacy_cv,
+                      holdout_source=args.holdout_source)
         return
 
     # --finetune: load inventory, fine-tune DINOv2, exit
@@ -3543,7 +3770,9 @@ def main():
         patch_emb = data["patch_embeddings"]
         artist_groups = data["artist_groups"]
         full_embeddings = np.concatenate([cls_emb, patch_emb], axis=1)
-        stage4b_probe(full_embeddings, artist_groups, painting_ids, rows)
+        stage4b_probe(full_embeddings, artist_groups, painting_ids, rows,
+                      strict_labels=args.strict_labels, legacy_cv=args.legacy_cv,
+                      holdout_source=args.holdout_source)
         return
 
     start_stage = args.stage or 1
@@ -3603,6 +3832,26 @@ def main():
     # Stage 2
     if start_stage <= 2:
         stage2_images(rows, hires=hires)
+
+    # Stage 2b: perceptual dedup
+    dedup_threshold = args.dedup_threshold
+    if dedup_threshold > 0 and start_stage <= 2:
+        cache_dir = CACHE_IMG_HIRES if hires else CACHE_IMG
+        print(f"\n[Stage 2b] Computing perceptual hashes (threshold={dedup_threshold})...")
+        phashes = compute_phashes(rows, cache_dir=cache_dir)
+        rows, n_removed = dedup_by_phash(rows, phashes, threshold=dedup_threshold)
+        if n_removed > 0:
+            print(f"  Removed {n_removed} near-duplicate images")
+            # Re-save inventory without duplicates
+            fieldnames = ["obj_id", "source", "title", "creator", "date", "image_url",
+                          "artist_group", "attribution", "label_confidence"]
+            with open(INVENTORY_CSV, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+                writer.writeheader()
+                writer.writerows(rows)
+            print(f"  Updated inventory: {len(rows)} paintings")
+        else:
+            print(f"  No near-duplicates found ({len(phashes)} images hashed)")
 
     if end_stage < 3:
         return

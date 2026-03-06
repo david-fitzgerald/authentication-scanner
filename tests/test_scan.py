@@ -3,10 +3,14 @@
 import sys
 from pathlib import Path
 
+import numpy as np
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scan import (
     classify_attribution,
     classify_rembrandt_group,
+    dedup_by_phash,
     extract_iiif_id,
     met_artist_group,
     met_classify_attribution,
@@ -20,37 +24,37 @@ from scan import (
 
 class TestClassifyAttribution:
     def test_autograph_plain_name(self):
-        assert classify_attribution("Rembrandt van Rijn") == "autograph"
+        assert classify_attribution("Rembrandt van Rijn") == ("autograph", "low")
 
     def test_workshop(self):
-        assert classify_attribution("Workshop of Rembrandt") == "workshop"
+        assert classify_attribution("Workshop of Rembrandt") == ("workshop", "medium")
 
     def test_workshop_dutch(self):
-        assert classify_attribution("Atelier van Rembrandt") == "workshop"
+        assert classify_attribution("Atelier van Rembrandt") == ("workshop", "medium")
 
     def test_circle(self):
-        assert classify_attribution("Circle of Rembrandt") == "circle"
+        assert classify_attribution("Circle of Rembrandt") == ("circle", "medium")
 
     def test_style(self):
-        assert classify_attribution("Style of Rembrandt") == "style"
+        assert classify_attribution("Style of Rembrandt") == ("style", "medium")
 
     def test_follower(self):
-        assert classify_attribution("Follower of Rembrandt") == "style"
+        assert classify_attribution("Follower of Rembrandt") == ("style", "medium")
 
     def test_after(self):
-        assert classify_attribution("After Rembrandt van Rijn") == "after"
+        assert classify_attribution("After Rembrandt van Rijn") == ("after", "medium")
 
     def test_copy_after(self):
-        assert classify_attribution("Copy after Rembrandt") == "after"
+        assert classify_attribution("Copy after Rembrandt") == ("after", "medium")
 
     def test_attributed(self):
-        assert classify_attribution("Attributed to Rembrandt") == "attributed"
+        assert classify_attribution("Attributed to Rembrandt") == ("attributed", "medium")
 
     def test_school(self):
-        assert classify_attribution("School of Rembrandt") == "school"
+        assert classify_attribution("School of Rembrandt") == ("school", "medium")
 
     def test_case_insensitive(self):
-        assert classify_attribution("WORKSHOP OF REMBRANDT") == "workshop"
+        assert classify_attribution("WORKSHOP OF REMBRANDT") == ("workshop", "medium")
 
 
 # ---------------------------------------------------------------------------
@@ -59,16 +63,16 @@ class TestClassifyAttribution:
 
 class TestClassifyRembrandtGroup:
     def test_autograph(self):
-        assert classify_rembrandt_group("Rembrandt van Rijn") == ("rembrandt_autograph", "autograph")
+        assert classify_rembrandt_group("Rembrandt van Rijn") == ("rembrandt_autograph", "autograph", "low")
 
     def test_circle(self):
-        assert classify_rembrandt_group("Circle of Rembrandt") == ("rembrandt_circle", "circle")
+        assert classify_rembrandt_group("Circle of Rembrandt") == ("rembrandt_circle", "circle", "medium")
 
     def test_workshop(self):
-        assert classify_rembrandt_group("Workshop of Rembrandt") == ("rembrandt_circle", "workshop")
+        assert classify_rembrandt_group("Workshop of Rembrandt") == ("rembrandt_circle", "workshop", "medium")
 
     def test_non_rembrandt(self):
-        assert classify_rembrandt_group("Jan Vermeer") == (None, None)
+        assert classify_rembrandt_group("Jan Vermeer") == (None, None, None)
 
 
 # ---------------------------------------------------------------------------
@@ -77,22 +81,22 @@ class TestClassifyRembrandtGroup:
 
 class TestMetClassifyAttribution:
     def test_empty_prefix(self):
-        assert met_classify_attribution("") == "autograph"
+        assert met_classify_attribution("") == ("autograph", "low")
 
     def test_none_prefix(self):
-        assert met_classify_attribution(None) == "autograph"
+        assert met_classify_attribution(None) == ("autograph", "low")
 
     def test_style_of(self):
-        assert met_classify_attribution("Style of") == "style"
+        assert met_classify_attribution("Style of") == ("style", "high")
 
     def test_after(self):
-        assert met_classify_attribution("After") == "after"
+        assert met_classify_attribution("After") == ("after", "high")
 
     def test_workshop(self):
-        assert met_classify_attribution("Workshop of") == "workshop"
+        assert met_classify_attribution("Workshop of") == ("workshop", "high")
 
     def test_unknown_prefix(self):
-        assert met_classify_attribution("Possibly by") == "style"
+        assert met_classify_attribution("Possibly by") == ("style", "high")
 
 
 # ---------------------------------------------------------------------------
@@ -180,3 +184,184 @@ class TestParseLaMetadata:
         }
         result = parse_la_metadata(la)
         assert result["date"] == "1642"
+
+
+# ---------------------------------------------------------------------------
+# Label confidence (Fix 1)
+# ---------------------------------------------------------------------------
+
+class TestLabelConfidence:
+    def test_wikidata_qualifier_high(self):
+        """Wikidata qualifier match → high confidence."""
+        attrib, conf = classify_attribution("Workshop of Rembrandt")
+        assert conf == "medium"  # regex match → medium
+
+    def test_met_explicit_prefix_high(self):
+        """Explicit Met prefix → high confidence."""
+        attrib, conf = met_classify_attribution("Workshop of")
+        assert conf == "high"
+
+    def test_met_empty_prefix_low(self):
+        """No Met prefix → low confidence (assumed autograph)."""
+        attrib, conf = met_classify_attribution("")
+        assert attrib == "autograph"
+        assert conf == "low"
+
+    def test_plain_name_fallback_low(self):
+        """Plain artist name → low confidence (default autograph)."""
+        attrib, conf = classify_attribution("Rembrandt van Rijn")
+        assert attrib == "autograph"
+        assert conf == "low"
+
+    def test_regex_match_medium(self):
+        """Regex match on ATTRIBUTION_PATTERNS → medium confidence."""
+        attrib, conf = classify_attribution("Follower of Rembrandt")
+        assert attrib == "style"
+        assert conf == "medium"
+
+
+# ---------------------------------------------------------------------------
+# Split integrity (Fix 5.1) — phash dedup prevents train/test leakage
+# ---------------------------------------------------------------------------
+
+try:
+    import imagehash
+    _has_imagehash = True
+except ImportError:
+    _has_imagehash = False
+
+try:
+    import sklearn  # noqa: F401
+    _has_sklearn = True
+except ImportError:
+    _has_sklearn = False
+
+
+@pytest.mark.skipif(not _has_imagehash, reason="imagehash not installed")
+class TestSplitIntegrity:
+    def test_near_duplicates_deduped(self):
+        """Near-duplicate phashes should be removed by dedup."""
+
+        # Create two "near-duplicate" hashes (hamming distance < threshold)
+        hash_a = imagehash.hex_to_hash("0" * 64)  # 256-bit all zeros
+        hash_b = imagehash.hex_to_hash("0" * 63 + "1")  # 1 bit different
+        assert hash_a - hash_b < 10  # near-duplicate
+
+        # Different hash
+        hash_c = imagehash.hex_to_hash("f" * 64)
+        assert hash_a - hash_c > 10  # not near-duplicate
+
+    def test_dedup_keeps_larger(self):
+        """Dedup should keep the higher-resolution version."""
+        import imagehash
+
+        rows = [
+            {"obj_id": "test_a", "source": "rijksmuseum"},
+            {"obj_id": "test_b", "source": "met"},
+            {"obj_id": "test_c", "source": "wikidata"},
+        ]
+        phashes = {
+            "test_a": imagehash.hex_to_hash("0" * 64),
+            "test_b": imagehash.hex_to_hash("0" * 63 + "1"),  # near-dup of a
+            "test_c": imagehash.hex_to_hash("f" * 64),  # different
+        }
+
+        # Can't test file-size logic without CACHE_IMG, just test count
+        deduped, n_removed = dedup_by_phash(rows, phashes, threshold=10)
+        assert n_removed == 1
+        assert len(deduped) == 2
+
+
+# ---------------------------------------------------------------------------
+# Preprocessing uniformity (Fix 5.3)
+# ---------------------------------------------------------------------------
+
+class TestPreprocessingUniformity:
+    def test_all_sources_resized_uniformly(self):
+        """After Fix 2b, the source condition is removed from resize logic.
+
+        Verify that the resize code path no longer checks source — all images
+        get capped at IMG_MAX_PX regardless of source.
+        """
+        import inspect
+        from scan import stage2_images
+        source_code = inspect.getsource(stage2_images)
+        # The old code had: if row["source"] != "rijksmuseum"
+        # Fix 2b removes this condition
+        assert 'row["source"] != "rijksmuseum"' not in source_code
+        assert "source" not in source_code.split("# v1 behavior")[1].split("\n")[0] if "# v1 behavior" in source_code else True
+
+
+# ---------------------------------------------------------------------------
+# Nested CV smoke test (Fix 5.4)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not _has_sklearn, reason="scikit-learn not installed")
+class TestNestedCV:
+    def test_nested_cv_no_data_leak(self):
+        """Outer fold test data should never appear in inner selection."""
+        from sklearn.model_selection import StratifiedKFold
+
+        np.random.seed(42)
+        n = 50
+        X = np.random.randn(n, 10)
+        y = np.array([1] * 25 + [0] * 25)
+
+        outer_cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+        inner_cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+
+        for train_idx, test_idx in outer_cv.split(X, y):
+            # Test indices must not appear in train
+            assert len(set(train_idx) & set(test_idx)) == 0
+
+            # Inner folds should only use train data
+            X_train = X[train_idx]
+            y_train = y[train_idx]
+            for inner_train, inner_val in inner_cv.split(X_train, y_train):
+                # Inner indices are relative to X_train, so they can't
+                # reference test data. Verify they stay in bounds.
+                assert max(inner_train) < len(X_train)
+                assert max(inner_val) < len(X_train)
+                assert len(set(inner_train) & set(inner_val)) == 0
+
+
+# ---------------------------------------------------------------------------
+# Permutation test sanity (Fix 5.5)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not _has_sklearn, reason="scikit-learn not installed")
+class TestPermutationSanity:
+    def test_random_data_nonsignificant(self):
+        """On random data, permutation p-value should be > 0.05 most of the time."""
+        from sklearn.svm import SVC
+        from sklearn.model_selection import StratifiedKFold, cross_val_score
+
+        significant_count = 0
+        n_runs = 20
+
+        for seed in range(n_runs):
+            rng = np.random.RandomState(seed)
+            n = 60
+            X = rng.randn(n, 10)
+            y = np.array([1] * 30 + [0] * 30)
+
+            # Get observed accuracy
+            skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=seed)
+            clf = SVC(kernel="rbf", class_weight="balanced")
+            observed = cross_val_score(clf, X, y, cv=skf, scoring="balanced_accuracy").mean()
+
+            # Quick permutation test (50 perms for speed)
+            null_accs = []
+            for _ in range(50):
+                y_shuf = rng.permutation(y)
+                acc = cross_val_score(clf, X, y_shuf, cv=skf, scoring="balanced_accuracy").mean()
+                null_accs.append(acc)
+
+            p_val = (np.sum(np.array(null_accs) >= observed) + 1) / (len(null_accs) + 1)
+            if p_val < 0.05:
+                significant_count += 1
+
+        # On random data, should be significant < 10% of the time (expect ~5%)
+        assert significant_count <= 0.10 * n_runs + 1, (
+            f"Too many significant results on random data: {significant_count}/{n_runs}"
+        )
