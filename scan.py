@@ -2975,6 +2975,12 @@ def stage_lora(rows, label="Rembrandt", results_file=None):
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     fold_results = []
 
+    # Build model ONCE, reset weights between folds to avoid CUDA memory fragmentation
+    model, trainable = _build_lora_model()
+    model.to(device)
+    print(f"  Trainable params: {trainable:,}")
+    _initial_state = {k: v.clone() for k, v in model.state_dict().items()}
+
     for fold, (train_idx, val_idx) in enumerate(skf.split(img_paths, labels)):
         print(f"\n  --- Fold {fold + 1}/5 ---")
         print(f"  Train: {sum(labels[train_idx])} auto + {sum(1 - labels[train_idx])} circle = {len(train_idx)}")
@@ -2992,10 +2998,8 @@ def stage_lora(rows, label="Rembrandt", results_file=None):
         train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=sampler, num_workers=0)
         val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
 
-        model, trainable = _build_lora_model()
-        if fold == 0:
-            print(f"  Trainable params: {trainable:,}")
-        model.to(device)
+        # Reset to initial weights (no GPU reallocation)
+        model.load_state_dict(_initial_state)
         optimizer = torch.optim.AdamW(
             [p for p in model.parameters() if p.requires_grad],
             lr=lr, weight_decay=weight_decay
@@ -3052,11 +3056,11 @@ def stage_lora(rows, label="Rembrandt", results_file=None):
             "best_val_bal_acc": round(best_val_bal_acc, 4),
             "best_epoch": best_epoch,
         })
-        del model
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        elif torch.backends.mps.is_available():
-            torch.mps.empty_cache()
+
+    # Clean up after all folds
+    del model, _initial_state
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     accs = [r["best_val_bal_acc"] for r in fold_results]
     mean_acc = np.mean(accs)
@@ -3168,7 +3172,13 @@ def stage_lora_transfer(rows):
     patience = 10
     batch_size = 4
 
-    def _train_lora_fold(train_idx, val_idx, fold_label=""):
+    # Build model ONCE, save initial state for resetting between folds.
+    # Rebuilding via torch.hub.load each fold causes CUDA memory fragmentation → crash.
+    shared_model, _ = _build_lora_model()
+    shared_model.to(device)
+    initial_state = {k: v.clone() for k, v in shared_model.state_dict().items()}
+
+    def _train_lora_fold(model, init_state, train_idx, val_idx, fold_label=""):
         """Train one LoRA fold, return best validation balanced accuracy."""
         train_ds = PaintingDataset(train_idx, train_transform)
         val_ds = PaintingDataset(val_idx, val_transform)
@@ -3185,8 +3195,8 @@ def stage_lora_transfer(rows):
         train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=sampler, num_workers=0)
         val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
 
-        model, _ = _build_lora_model()
-        model.to(device)
+        # Reset model weights to initial state (no reallocation)
+        model.load_state_dict(init_state)
         optimizer = torch.optim.AdamW(
             [p for p in model.parameters() if p.requires_grad],
             lr=lr, weight_decay=weight_decay
@@ -3230,11 +3240,6 @@ def stage_lora_transfer(rows):
                 if no_improve >= patience:
                     break
 
-        del model
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        elif torch.backends.mps.is_available():
-            torch.mps.empty_cache()
         print(f"    {fold_label}: {best_val_bal_acc:.3f} (epoch {best_epoch})")
         return best_val_bal_acc
 
@@ -3254,9 +3259,14 @@ def stage_lora_transfer(rows):
             c2_results.append({"artist": test_artist, "bal_acc": None})
             continue
 
-        bal_acc = _train_lora_fold(train_idx, test_idx, fold_label=test_artist)
+        bal_acc = _train_lora_fold(shared_model, initial_state, train_idx, test_idx, fold_label=test_artist)
         c2_results.append({"artist": test_artist, "bal_acc": round(bal_acc, 4) if bal_acc else None,
                            "n_auto": n_test_auto, "n_circle": n_test_circle})
+
+    # Clean up shared model after all folds
+    del shared_model, initial_state
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     valid_c2 = [r for r in c2_results if r["bal_acc"] is not None]
     mean_c2 = np.mean([r["bal_acc"] for r in valid_c2]) if valid_c2 else 0
@@ -3445,6 +3455,11 @@ def stage_lora_curriculum(transfer_rows, rembrandt_rows):
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     fold_results = []
 
+    # Build model ONCE, reset to phase1 weights between folds
+    _phase2_model, _ = _build_lora_model()
+    _phase1_state = torch.load(phase1_weights_path, weights_only=True)
+    _phase2_model.to(device)
+
     for fold, (train_idx, val_idx) in enumerate(skf.split(phase2_paths, phase2_labels)):
         print(f"\n  --- Fold {fold + 1}/5 ---")
         train_ds = IndexDataset(train_idx, phase2_paths, phase2_labels, train_transform)
@@ -3459,13 +3474,11 @@ def stage_lora_curriculum(transfer_rows, rembrandt_rows):
         train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=sampler, num_workers=0)
         val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
 
-        # Load fresh model with phase 1 weights
-        model, _ = _build_lora_model()
-        model.load_state_dict(torch.load(phase1_weights_path, weights_only=True))
-        model.to(device)
+        # Reset model to phase 1 weights (no GPU reallocation)
+        _phase2_model.load_state_dict(_phase1_state)
 
         optimizer = torch.optim.AdamW(
-            [p for p in model.parameters() if p.requires_grad],
+            [p for p in _phase2_model.parameters() if p.requires_grad],
             lr=phase2_lr, weight_decay=0.01
         )
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=phase2_epochs)
@@ -3476,23 +3489,23 @@ def stage_lora_curriculum(transfer_rows, rembrandt_rows):
         no_improve = 0
 
         for epoch in range(phase2_epochs):
-            model.train()
+            _phase2_model.train()
             for X_batch, y_batch in train_loader:
                 X_batch = X_batch.to(device)
                 y_batch = y_batch.float().to(device)
                 optimizer.zero_grad()
-                logits = model(X_batch)
+                logits = _phase2_model(X_batch)
                 loss = criterion(logits, y_batch)
                 loss.backward()
                 optimizer.step()
             scheduler.step()
 
-            model.eval()
+            _phase2_model.eval()
             val_preds, val_true = [], []
             with torch.no_grad():
                 for X_batch, y_batch in val_loader:
                     X_batch = X_batch.to(device)
-                    logits = model(X_batch)
+                    logits = _phase2_model(X_batch)
                     preds = (logits > 0).long().cpu().numpy()
                     val_preds.extend(preds)
                     val_true.extend(y_batch.numpy())
@@ -3517,11 +3530,10 @@ def stage_lora_curriculum(transfer_rows, rembrandt_rows):
             "best_val_bal_acc": round(best_val_bal_acc, 4),
             "best_epoch": best_epoch,
         })
-        del model
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        elif torch.backends.mps.is_available():
-            torch.mps.empty_cache()
+
+    del _phase2_model, _phase1_state
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     accs = [r["best_val_bal_acc"] for r in fold_results]
     mean_acc = np.mean(accs)
