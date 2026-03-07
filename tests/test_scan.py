@@ -16,6 +16,12 @@ from scan import (
     met_artist_group,
     met_classify_attribution,
     parse_la_metadata,
+    _aug_jpeg_q30,
+    _aug_gaussian_blur,
+    _aug_brightness_120,
+    _aug_center_crop_10,
+    _aug_horizontal_flip,
+    _embed_single_image,
 )
 
 
@@ -471,3 +477,69 @@ class TestConfounderAudit:
         assert result["test1_source_acc"] > 0.80, (
             f"Source classifier should detect injected signal: {result['test1_source_acc']}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Robustness: augmentation functions
+# ---------------------------------------------------------------------------
+
+class TestAugmentations:
+    """Test augmentation functions (no GPU needed)."""
+
+    @pytest.fixture
+    def sample_img(self):
+        from PIL import Image
+        return Image.new("RGB", (500, 400), color=(128, 64, 32))
+
+    def test_jpeg_q30_returns_rgb(self, sample_img):
+        out = _aug_jpeg_q30(sample_img)
+        assert out.mode == "RGB"
+        assert out.size == sample_img.size
+
+    def test_gaussian_blur_returns_rgb(self, sample_img):
+        out = _aug_gaussian_blur(sample_img)
+        assert out.mode == "RGB"
+        assert out.size == sample_img.size
+
+    def test_brightness_returns_rgb(self, sample_img):
+        out = _aug_brightness_120(sample_img)
+        assert out.mode == "RGB"
+        assert out.size == sample_img.size
+
+    def test_center_crop_preserves_size(self, sample_img):
+        out = _aug_center_crop_10(sample_img)
+        assert out.mode == "RGB"
+        assert out.size == sample_img.size
+
+    def test_horizontal_flip_returns_rgb(self, sample_img):
+        out = _aug_horizontal_flip(sample_img)
+        assert out.mode == "RGB"
+        assert out.size == sample_img.size
+
+    def test_horizontal_flip_is_mirror(self, sample_img):
+        from PIL import Image
+        # Create image with asymmetric content
+        img = Image.new("RGB", (100, 50), color=(0, 0, 0))
+        img.putpixel((0, 0), (255, 0, 0))  # red top-left
+        flipped = _aug_horizontal_flip(img)
+        assert flipped.getpixel((99, 0)) == (255, 0, 0)
+        assert flipped.getpixel((0, 0)) == (0, 0, 0)
+
+
+class TestEmbedSingleImage:
+    """Test _embed_single_image shape (skip without GPU)."""
+
+    @pytest.fixture
+    def check_torch(self):
+        try:
+            import torch
+            return torch
+        except ImportError:
+            pytest.skip("torch not installed")
+
+    def test_returns_none_for_tiny_image(self, check_torch):
+        """Image smaller than TILE_SIZE should return None."""
+        from PIL import Image
+        img = Image.new("RGB", (100, 100))  # smaller than 224x224
+        result = _embed_single_image(img, None, None, 16, None, entropy=False)
+        assert result is None

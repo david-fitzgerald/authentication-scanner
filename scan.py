@@ -57,6 +57,7 @@ RESULTS_TRANSFER_JSON = CACHE_DIR / "results_transfer.json"
 RESULTS_LORA_JSON = CACHE_DIR / "results_lora.json"
 RESULTS_LORA_TRANSFER_JSON = CACHE_DIR / "results_lora_transfer.json"
 RESULTS_LORA_CURRICULUM_JSON = CACHE_DIR / "results_lora_curriculum.json"
+RESULTS_ROBUSTNESS_JSON = CACHE_DIR / "results_robustness.json"
 
 TILE_SIZE = 224
 IMG_MAX_PX = 2000        # v1 low-res cap
@@ -1287,6 +1288,58 @@ def _tile_batches(img, tile_size, batch_size, transform):
         yield torch.stack(batch)
 
 
+def _embed_single_image(img, model, device, batch_size, dino_transform,
+                        entropy=False, return_raw=False):
+    """Embed one PIL Image -> (cls_vec, patch_vec) numpy arrays.
+
+    Returns None if image has zero tiles.
+    If return_raw=True, returns (all_cls, all_patch) raw tile arrays instead of aggregated.
+    """
+    import torch
+
+    w, h = img.size
+    n_tiles = (w // TILE_SIZE) * (h // TILE_SIZE)
+    if n_tiles == 0:
+        return None
+
+    all_cls = []
+    all_patch = []
+    all_tile_var = []
+    for batch_tensor in _tile_batches(img, TILE_SIZE, batch_size, dino_transform):
+        batch_tensor = batch_tensor.to(device)
+        with torch.no_grad():
+            out = model.forward_features(batch_tensor)
+            all_cls.append(out["x_norm_clstoken"].cpu().numpy())
+            patch_tokens = out["x_norm_patchtokens"]
+            all_patch.append(patch_tokens.mean(dim=1).cpu().numpy())
+            if entropy:
+                tile_var = patch_tokens.var(dim=1).mean(dim=1)
+                all_tile_var.append(tile_var.cpu().numpy())
+
+    all_cls = np.concatenate(all_cls, axis=0)
+    all_patch = np.concatenate(all_patch, axis=0)
+
+    if return_raw:
+        return all_cls, all_patch
+
+    if entropy:
+        tile_vars = np.concatenate(all_tile_var)
+        var_std = tile_vars.std()
+        if var_std > 1e-6:
+            z = (tile_vars - tile_vars.mean()) / var_std
+            weights = np.exp(z)
+            weights /= weights.sum()
+        else:
+            weights = np.ones(len(tile_vars)) / len(tile_vars)
+        cls_vec = (all_cls * weights[:, None]).sum(axis=0)
+        patch_vec = (all_patch * weights[:, None]).sum(axis=0)
+    else:
+        cls_vec = all_cls.mean(axis=0)
+        patch_vec = all_patch.mean(axis=0)
+
+    return cls_vec, patch_vec
+
+
 def stage3_embed(rows, hires=False, model_name="vitb14", entropy=False, emb_file_override=None):
     """Tile images and embed with DINOv2.
 
@@ -1374,68 +1427,38 @@ def stage3_embed(rows, hires=False, model_name="vitb14", entropy=False, emb_file
                 skipped += 1
                 continue
 
-            w, h = img.size
-            n_tiles = (w // TILE_SIZE) * (h // TILE_SIZE)
-            if n_tiles == 0:
+            if hires:
+                result = _embed_single_image(img, model, device, batch_size,
+                                             dino_transform, return_raw=True)
+            else:
+                result = _embed_single_image(img, model, device, batch_size,
+                                             dino_transform, entropy=entropy)
+            if result is None:
                 skipped += 1
+                del img
                 continue
 
-            # Stream tiles through model — never hold all in memory
-            all_cls = []
-            all_patch = []
-            all_tile_var = []
-            for batch_tensor in _tile_batches(img, TILE_SIZE, batch_size, dino_transform):
-                batch_tensor = batch_tensor.to(device)
-                with torch.no_grad():
-                    out = model.forward_features(batch_tensor)
-                    all_cls.append(out["x_norm_clstoken"].cpu().numpy())
-                    patch_tokens = out["x_norm_patchtokens"]
-                    all_patch.append(patch_tokens.mean(dim=1).cpu().numpy())
-                    if entropy:
-                        # Patch token variance = visual complexity proxy
-                        tile_var = patch_tokens.var(dim=1).mean(dim=1)  # (batch,)
-                        all_tile_var.append(tile_var.cpu().numpy())
-
-            all_cls = np.concatenate(all_cls, axis=0)    # (N_tiles, embed_dim)
-            all_patch = np.concatenate(all_patch, axis=0)  # (N_tiles, embed_dim)
-
-            painting_ids.append(row["obj_id"])
-
-            if entropy:
-                tile_vars = np.concatenate(all_tile_var)
-                var_std = tile_vars.std()
-                if var_std > 1e-6:
-                    z = (tile_vars - tile_vars.mean()) / var_std
-                    weights = np.exp(z)
-                    weights /= weights.sum()
-                else:
-                    weights = np.ones(len(tile_vars)) / len(tile_vars)
-                cls_mean_list.append((all_cls * weights[:, None]).sum(axis=0))
-                patch_mean_list.append((all_patch * weights[:, None]).sum(axis=0))
-                # Diagnostic for first 3 paintings
-                if len(painting_ids) <= 3:
-                    uniform = 1.0 / len(tile_vars)
-                    print(f"      {row['obj_id']}: {len(tile_vars)} tiles, "
-                          f"var range [{tile_vars.min():.4f}, {tile_vars.max():.4f}], "
-                          f"weight range [{weights.min():.4f}, {weights.max():.4f}], "
-                          f"max/uniform {weights.max()/uniform:.1f}x")
-            else:
+            if hires:
+                all_cls, all_patch = result
                 cls_mean_list.append(all_cls.mean(axis=0))
                 patch_mean_list.append(all_patch.mean(axis=0))
-
-            if hires:
-                # Distribution features: std captures style consistency
                 cls_std_list.append(all_cls.std(axis=0))
                 patch_std_list.append(all_patch.std(axis=0))
+                if len(painting_ids) % 10 == 0 or len(painting_ids) == 0:
+                    w, h = img.size
+                    n_tiles = (w // TILE_SIZE) * (h // TILE_SIZE)
+                    print(f"      {row['obj_id']}: {img.size[0]}x{img.size[1]}, {n_tiles} tiles")
+            else:
+                cls_vec, patch_vec = result
+                cls_mean_list.append(cls_vec)
+                patch_mean_list.append(patch_vec)
 
+            painting_ids.append(row["obj_id"])
             groups_list.append(row["artist_group"])
             attribs_list.append(row["attribution"])
             artists_list.append(row.get("artist", ""))
 
-            if hires and (len(painting_ids) % 10 == 0 or len(painting_ids) == 1):
-                print(f"      {row['obj_id']}: {img.size[0]}x{img.size[1]}, {n_tiles} tiles")
-
-            del all_cls, all_patch, img
+            del img
 
         print(f"    Chunk {ci+1}/{len(chunk_starts)} done ({len(painting_ids)} embedded, {skipped} skipped)")
 
@@ -2322,6 +2345,214 @@ def confounder_audit():
     with open(RESULTS_CONFOUNDER_JSON, "w") as f:
         json.dump(results, f, indent=2)
     print(f"\n  Saved → {RESULTS_CONFOUNDER_JSON}")
+
+
+# ---------------------------------------------------------------------------
+# Robustness test: augmentation flip rate
+# ---------------------------------------------------------------------------
+
+def _aug_jpeg_q30(img):
+    """JPEG compression at quality 30."""
+    buf = BytesIO()
+    img.save(buf, format="JPEG", quality=30)
+    buf.seek(0)
+    return Image.open(buf).convert("RGB")
+
+
+def _aug_gaussian_blur(img):
+    """Gaussian blur with sigma=2."""
+    from PIL import ImageFilter
+    return img.filter(ImageFilter.GaussianBlur(radius=2))
+
+
+def _aug_brightness_120(img):
+    """Brightness increase by 20%."""
+    from PIL import ImageEnhance
+    return ImageEnhance.Brightness(img).enhance(1.2)
+
+
+def _aug_center_crop_10(img):
+    """10% center crop, resized back to original dimensions."""
+    w, h = img.size
+    crop_x = int(w * 0.05)
+    crop_y = int(h * 0.05)
+    cropped = img.crop((crop_x, crop_y, w - crop_x, h - crop_y))
+    return cropped.resize((w, h), Image.LANCZOS)
+
+
+def _aug_horizontal_flip(img):
+    """Horizontal flip (mirror)."""
+    return img.transpose(Image.FLIP_LEFT_RIGHT)
+
+
+AUGMENTATIONS = [
+    ("JPEG q=30", _aug_jpeg_q30),
+    ("Gaussian blur s=2", _aug_gaussian_blur),
+    ("Brightness +20%", _aug_brightness_120),
+    ("Center crop 10%", _aug_center_crop_10),
+    ("Horizontal flip", _aug_horizontal_flip),
+]
+
+FLIP_RATE_THRESHOLD = 0.05  # 5%
+
+
+def robustness_test():
+    """Test prediction stability under benign image augmentations.
+
+    Train SVM RBF on clean entropy embeddings (autograph+circle),
+    re-embed under 5 augmentations, measure prediction flip rate.
+    Pass criterion: <5% flip rate per augmentation.
+    """
+    import torch
+    from torchvision import transforms
+    from sklearn.decomposition import PCA
+    from sklearn.svm import SVC
+
+    print("\n" + "=" * 60)
+    print("  ROBUSTNESS TEST")
+    print("=" * 60)
+
+    # --- Load clean data ---
+    if not EMBEDDINGS_ENTROPY_NPZ.exists():
+        print("ERROR: No cached entropy embeddings. Run --entropy pipeline first.")
+        sys.exit(1)
+
+    data = np.load(EMBEDDINGS_ENTROPY_NPZ, allow_pickle=True)
+    painting_ids = data["painting_ids"]
+    artist_groups = data["artist_groups"]
+    cls_emb = data["cls_embeddings"]
+    patch_emb = data["patch_embeddings"]
+
+    # Filter to autograph + circle
+    mask = np.isin(artist_groups, ["autograph", "circle"])
+    painting_ids = painting_ids[mask]
+    artist_groups = artist_groups[mask]
+    full_emb = np.concatenate([cls_emb[mask], patch_emb[mask]], axis=1)
+    labels = (artist_groups == "autograph").astype(int)  # 1=autograph, 0=circle
+
+    N = len(painting_ids)
+    print(f"  Paintings: {N} (autograph={labels.sum()}, circle={N - labels.sum()})")
+
+    # --- Train fixed classifier on clean data ---
+    pca = PCA(n_components=20, random_state=42)
+    X_pca = pca.fit_transform(full_emb)
+    clf = SVC(kernel="rbf", C=1.0, random_state=42)
+    clf.fit(X_pca, labels)
+    clean_preds = clf.predict(X_pca)
+    print(f"  Clean train accuracy: {(clean_preds == labels).mean():.3f}")
+
+    # --- Load DINOv2 ---
+    if torch.backends.mps.is_available():
+        device = torch.device("mps")
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
+    print(f"  Device: {device}")
+
+    dino_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+    print("  Loading DINOv2 ViT-B/14...")
+    model = torch.hub.load("facebookresearch/dinov2", "dinov2_vitb14")
+    model = model.to(device)
+    model.eval()
+    print("  Model loaded")
+
+    # --- Run augmentations ---
+    results = {}
+    img_dir = CACHE_IMG
+
+    for aug_name, aug_fn in AUGMENTATIONS:
+        print(f"\n  Augmentation: {aug_name}")
+        aug_cls_list = []
+        aug_patch_list = []
+        aug_ids = []
+        skipped = 0
+
+        for i, pid in enumerate(painting_ids):
+            img_path = img_dir / f"{pid}.jpg"
+            if not img_path.exists():
+                skipped += 1
+                continue
+
+            try:
+                img = Image.open(img_path).convert("RGB")
+            except Exception:
+                skipped += 1
+                continue
+
+            aug_img = aug_fn(img)
+            result = _embed_single_image(aug_img, model, device, BATCH_SIZE_VITB,
+                                         dino_transform, entropy=True)
+            del img, aug_img
+
+            if result is None:
+                skipped += 1
+                continue
+
+            cls_vec, patch_vec = result
+            aug_cls_list.append(cls_vec)
+            aug_patch_list.append(patch_vec)
+            aug_ids.append(pid)
+
+            if (i + 1) % 100 == 0:
+                print(f"    {i + 1}/{N} embedded")
+
+        if not aug_cls_list:
+            print("    SKIP — no images embedded")
+            results[aug_name] = {"flip_rate": None, "flips": 0, "total": 0, "verdict": "SKIP"}
+            continue
+
+        aug_emb = np.concatenate([
+            np.array(aug_cls_list), np.array(aug_patch_list)
+        ], axis=1)
+        aug_pca = pca.transform(aug_emb)
+        aug_preds = clf.predict(aug_pca)
+
+        # Match predictions to clean predictions by painting ID
+        clean_pred_by_id = dict(zip(painting_ids, clean_preds))
+        flips = sum(1 for pid, pred in zip(aug_ids, aug_preds)
+                    if clean_pred_by_id.get(pid) != pred)
+        total = len(aug_ids)
+        flip_rate = flips / total if total > 0 else 0.0
+        verdict = "PASS" if flip_rate < FLIP_RATE_THRESHOLD else "FAIL"
+
+        results[aug_name] = {
+            "flip_rate": round(flip_rate, 4),
+            "flips": flips,
+            "total": total,
+            "skipped": skipped,
+            "verdict": verdict,
+        }
+        print(f"    {flips}/{total} flipped ({flip_rate:.1%}) — {verdict}")
+
+    del model
+
+    # --- Summary ---
+    all_pass = all(r["verdict"] == "PASS" for r in results.values() if r["verdict"] != "SKIP")
+    overall = "PASS" if all_pass else "FAIL"
+
+    print(f"\n{'='*60}")
+    print("  ROBUSTNESS TEST RESULTS")
+    print(f"{'='*60}")
+    print(f"  {'Augmentation':<22s} {'Flip Rate':>10s}   {'Flips/Total':>12s}   Verdict")
+    for aug_name, r in results.items():
+        if r["verdict"] == "SKIP":
+            print(f"  {aug_name:<22s} {'N/A':>10s}   {'N/A':>12s}   SKIP")
+        else:
+            ft = f"{r['flips']}/{r['total']}"
+            print(f"  {aug_name:<22s} {r['flip_rate']:>9.1%}   {ft:>12s}   {r['verdict']}")
+    print(f"{'='*60}")
+    print(f"  Overall:              {overall} ({'all <5%' if all_pass else 'some >=5%'})")
+    print(f"{'='*60}")
+
+    output = {"augmentations": results, "overall_verdict": overall, "n_paintings": N,
+              "threshold": FLIP_RATE_THRESHOLD}
+    with open(RESULTS_ROBUSTNESS_JSON, "w") as f:
+        json.dump(output, f, indent=2)
+    print(f"\n  Saved → {RESULTS_ROBUSTNESS_JSON}")
 
 
 # ---------------------------------------------------------------------------
@@ -3824,6 +4055,8 @@ def main():
                         help="Use legacy non-nested CV (for comparison with old results)")
     parser.add_argument("--confounder-audit", action="store_true",
                         help="Run confounder audit: source classifier + within-source probes")
+    parser.add_argument("--robustness-test", action="store_true",
+                        help="Test prediction stability under benign image augmentations")
     args = parser.parse_args()
     hires = args.hires
     model_name = args.model
@@ -3855,6 +4088,11 @@ def main():
     # --confounder-audit: source confound analysis, exit
     if args.confounder_audit:
         confounder_audit()
+        return
+
+    # --robustness-test: augmentation flip rate test, exit
+    if args.robustness_test:
+        robustness_test()
         return
 
     # --concat --probe: concatenate all three embedding sets, run probe, exit
