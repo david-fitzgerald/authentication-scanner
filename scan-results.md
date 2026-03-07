@@ -1,5 +1,5 @@
 ---
-version: 0.10.0
+version: 0.11.0
 date: 2026-03-07
 status: active
 ---
@@ -540,6 +540,38 @@ The 63.7% balanced accuracy is not a source artifact. The attribution signal sur
 
 **Implication:** Safe to proceed to Tier 3 experiments without deconfounding. The frozen-feature ceiling of 63.7% reflects genuine (if weak) attribution signal in DINOv2 entropy-weighted embeddings.
 
+## Robustness Test: Are Predictions Stable Under Image Perturbations?
+
+**Date:** 2026-03-07
+
+**Question:** If predictions flip under JPEG compression or mild blur, the model is fragile and unsuitable for real-world use where paintings are photographed under varying conditions. Does the 63.7% signal survive benign image augmentations?
+
+**Method:** Train a fixed SVM RBF classifier (PCA=20, C=1.0) on all clean entropy embeddings (N=711, 562 autograph + 149 circle). For each augmentation, reload every image, apply the transform, re-tile, re-embed with DINOv2 ViT-B/14, PCA-transform with the clean-fitted PCA, and predict with the trained SVM. Count how many predictions flip vs clean. Pass criterion: <5% flip rate per augmentation.
+
+### Results
+
+| Augmentation | Flip Rate | Flips/Total | Verdict |
+|---|---|---|---|
+| JPEG q=30 | 1.3% | 9/711 | PASS |
+| Gaussian blur σ=2 | 1.0% | 7/711 | PASS |
+| Brightness +20% | 0.1% | 1/711 | PASS |
+| Center crop 10% | 2.7% | 19/711 | PASS |
+| Horizontal flip | 1.3% | 9/711 | PASS |
+| **Overall** | | | **PASS** |
+
+### Interpretation
+
+All augmentations well under the 5% threshold. The model is robust to the kinds of variation encountered when different people photograph the same painting:
+
+- **Brightness** is the most stable (0.1%) — the model is nearly invariant to lighting changes, likely because DINOv2's ImageNet normalization already handles this.
+- **Center crop** has the highest flip rate (2.7%) — losing edge tiles removes some discriminative information, but the effect is modest.
+- **JPEG** and **horizontal flip** are equivalent at 1.3% — compression artifacts and mirror reversal don't meaningfully alter the embedding space.
+- **Gaussian blur** at 1.0% confirms the signal isn't in high-frequency texture detail.
+
+### Verdict
+
+The 63.7% balanced accuracy is robust to benign image perturbations. Predictions are stable across realistic photography variations. Safe to proceed to calibration.
+
 ## Files
 
 | File | What |
@@ -557,6 +589,7 @@ The 63.7% balanced accuracy is not a source artifact. The attribution signal sur
 | `cache/results_tiles.json` | v1-E per-tile probe metrics |
 | `cache/results_clip.json` | v1-J CLIP probe metrics |
 | `cache/results_confounder.json` | Confounder audit results (source classifier + within-source probes) |
+| `cache/results_robustness.json` | Robustness test results (augmentation flip rates) |
 | `cache/embeddings/embeddings_tiles.npz` | Per-tile CLS embeddings (37K tiles, 106MB) |
 | `cache/embeddings/embeddings_clip.npz` | CLIP ViT-L/14 embeddings (768d) |
 | `cache/plots/` | UMAP, cosine, heatmap for latest run |
