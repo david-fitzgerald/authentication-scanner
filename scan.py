@@ -51,6 +51,7 @@ EMBEDDINGS_ENTROPY_VITL_NPZ = CACHE_EMB / "embeddings_entropy_vitl.npz"
 RESULTS_ENTROPY_JSON = CACHE_DIR / "results_entropy.json"
 RESULTS_ENTROPY_VITL_JSON = CACHE_DIR / "results_entropy_vitl.json"
 RESULTS_PROBE_JSON = CACHE_DIR / "results_probe.json"
+RESULTS_CONFOUNDER_JSON = CACHE_DIR / "results_confounder.json"
 EMBEDDINGS_TRANSFER_NPZ = CACHE_EMB / "embeddings_transfer.npz"
 RESULTS_TRANSFER_JSON = CACHE_DIR / "results_transfer.json"
 RESULTS_LORA_JSON = CACHE_DIR / "results_lora.json"
@@ -2115,6 +2116,215 @@ def stage4b_probe(full_embeddings, artist_groups, painting_ids, rows,
 
 
 # ---------------------------------------------------------------------------
+# Confounder Audit — source classifier + within-source probe
+# ---------------------------------------------------------------------------
+
+def confounder_audit():
+    """Test whether embeddings encode source (museum) rather than brushwork style.
+
+    Three tests:
+    1. Source classifier — can we predict which museum from embeddings?
+    2. Wikidata-only probe — autograph vs circle within largest single source
+    3. Source-stratified probe — CV folds preserve source proportions
+    """
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.model_selection import StratifiedKFold, cross_val_score
+    from sklearn.decomposition import PCA
+    from sklearn.svm import SVC
+
+    print("\n" + "=" * 60)
+    print("  CONFOUNDER AUDIT")
+    print("=" * 60)
+
+    # Load data
+    if not INVENTORY_CSV.exists():
+        print("ERROR: No cached inventory. Run full pipeline first.")
+        sys.exit(1)
+    if not EMBEDDINGS_ENTROPY_NPZ.exists():
+        print("ERROR: No cached entropy embeddings. Run --entropy pipeline first.")
+        sys.exit(1)
+
+    with open(INVENTORY_CSV) as f:
+        rows = list(csv.DictReader(f))
+    source_by_id = {r["obj_id"]: r["source"] for r in rows}
+
+    data = np.load(EMBEDDINGS_ENTROPY_NPZ, allow_pickle=True)
+    painting_ids = data["painting_ids"]
+    artist_groups = data["artist_groups"]
+    cls_emb = data["cls_embeddings"]
+    patch_emb = data["patch_embeddings"]
+    X_all = np.concatenate([cls_emb, patch_emb], axis=1)
+
+    # Filter to autograph + circle
+    ac_mask = np.array([(g in ("rembrandt_autograph", "rembrandt_circle"))
+                        for g in artist_groups])
+    X = X_all[ac_mask]
+    y_attr = np.array([1 if g == "rembrandt_autograph" else 0
+                       for g in artist_groups[ac_mask]])
+    ids = painting_ids[ac_mask]
+    sources = np.array([source_by_id.get(pid, "unknown") for pid in ids])
+
+    n = len(y_attr)
+    print(f"\n  Dataset: {n} paintings (autograph+circle)")
+    from collections import Counter
+    src_counts = Counter(sources)
+    for s, c in src_counts.most_common():
+        print(f"    {s}: {c}")
+
+    results = {"n_total": n, "source_counts": dict(src_counts)}
+
+    # --- Test 1: Source classifier ---
+    print("\n  --- Test 1: Source Classifier ---")
+    unique_sources = sorted(set(sources))
+    y_source = np.array([unique_sources.index(s) for s in sources])
+
+    pca = PCA(n_components=min(20, n - 1), random_state=42)
+    X_pca = pca.fit_transform(X)
+
+    clf_src = LogisticRegression(C=1.0, solver="lbfgs", max_iter=1000,
+                                 class_weight="balanced")
+    skf = StratifiedKFold(n_splits=10, shuffle=True, random_state=42)
+    src_scores = cross_val_score(clf_src, X_pca, y_source, cv=skf,
+                                 scoring="balanced_accuracy")
+    src_acc = src_scores.mean()
+    src_std = src_scores.std()
+    chance = 1.0 / len(unique_sources)
+    print(f"  Sources: {unique_sources}")
+    print(f"  Balanced accuracy: {src_acc:.3f} ± {src_std:.3f}")
+    print(f"  Chance level: {chance:.3f}")
+    results["test1_source_acc"] = round(src_acc, 4)
+    results["test1_source_std"] = round(src_std, 4)
+    results["test1_chance"] = round(chance, 4)
+
+    # --- Test 2: Wikidata-only probe ---
+    print("\n  --- Test 2: Wikidata-Only Probe ---")
+    wd_mask = sources == "wikidata"
+    X_wd = X[wd_mask]
+    y_wd = y_attr[wd_mask]
+    n_wd = len(y_wd)
+    n_wd_auto = int(y_wd.sum())
+    n_wd_circle = n_wd - n_wd_auto
+    print(f"  N={n_wd} ({n_wd_auto} autograph + {n_wd_circle} circle)")
+
+    if n_wd < 20:
+        print("  SKIP: too few wikidata paintings for meaningful CV")
+        results["test2_wikidata_acc"] = None
+        results["test2_wikidata_n"] = n_wd
+    else:
+        pca_wd = PCA(n_components=min(20, n_wd - 1), random_state=42)
+        X_wd_pca = pca_wd.fit_transform(X_wd)
+
+        # Run same classifiers as main probe
+        best_wd_acc = 0
+        best_wd_name = ""
+        for name, make_clf in [
+            ("Logistic", lambda: LogisticRegression(C=1.0, solver="lbfgs",
+                                                     max_iter=1000, class_weight="balanced")),
+            ("SVM RBF", lambda: SVC(C=1.0, kernel="rbf", gamma="scale",
+                                     class_weight="balanced")),
+        ]:
+            skf_wd = StratifiedKFold(n_splits=min(10, min(n_wd_auto, n_wd_circle)),
+                                     shuffle=True, random_state=42)
+            scores = cross_val_score(make_clf(), X_wd_pca, y_wd, cv=skf_wd,
+                                     scoring="balanced_accuracy")
+            acc = scores.mean()
+            print(f"  {name}: {acc:.3f} ± {scores.std():.3f}")
+            if acc > best_wd_acc:
+                best_wd_acc = acc
+                best_wd_name = name
+
+        results["test2_wikidata_acc"] = round(best_wd_acc, 4)
+        results["test2_wikidata_clf"] = best_wd_name
+        results["test2_wikidata_n"] = n_wd
+
+    # --- Test 3: Source-stratified probe ---
+    print("\n  --- Test 3: Source-Stratified Probe ---")
+    # Create composite stratification label: source × attribution
+    strat_labels = np.array([f"{s}_{a}" for s, a in zip(sources, y_attr)])
+
+    # Check all strat groups have >= 2 members (needed for stratified CV)
+    strat_counts = Counter(strat_labels)
+    min_group = min(strat_counts.values())
+    if min_group < 2:
+        print("  Some strat groups have <2 members, falling back to source-aware grouping")
+        # Fall back: just use source as group, stratify on attribution
+        from sklearn.model_selection import GroupKFold
+        groups = y_source
+        pca_s = PCA(n_components=min(20, n - 1), random_state=42)
+        X_s_pca = pca_s.fit_transform(X)
+        n_groups = len(unique_sources)
+        gkf = GroupKFold(n_splits=min(n_groups, 3))
+        best_strat_acc = 0
+        best_strat_name = ""
+        for name, make_clf in [
+            ("Logistic", lambda: LogisticRegression(C=1.0, solver="lbfgs",
+                                                     max_iter=1000, class_weight="balanced")),
+            ("SVM RBF", lambda: SVC(C=1.0, kernel="rbf", gamma="scale",
+                                     class_weight="balanced")),
+        ]:
+            scores = cross_val_score(make_clf(), X_s_pca, y_attr, cv=gkf,
+                                     groups=groups, scoring="balanced_accuracy")
+            acc = scores.mean()
+            print(f"  {name} (GroupKFold by source): {acc:.3f} ± {scores.std():.3f}")
+            if acc > best_strat_acc:
+                best_strat_acc = acc
+                best_strat_name = name
+    else:
+        pca_s = PCA(n_components=min(20, n - 1), random_state=42)
+        X_s_pca = pca_s.fit_transform(X)
+        skf_s = StratifiedKFold(n_splits=10, shuffle=True, random_state=42)
+        best_strat_acc = 0
+        best_strat_name = ""
+        for name, make_clf in [
+            ("Logistic", lambda: LogisticRegression(C=1.0, solver="lbfgs",
+                                                     max_iter=1000, class_weight="balanced")),
+            ("SVM RBF", lambda: SVC(C=1.0, kernel="rbf", gamma="scale",
+                                     class_weight="balanced")),
+        ]:
+            scores = cross_val_score(make_clf(), X_s_pca, y_attr, cv=skf_s,
+                                     scoring="balanced_accuracy")
+            acc = scores.mean()
+            print(f"  {name} (stratified): {acc:.3f} ± {scores.std():.3f}")
+            if acc > best_strat_acc:
+                best_strat_acc = acc
+                best_strat_name = name
+
+    results["test3_stratified_acc"] = round(best_strat_acc, 4)
+    results["test3_stratified_clf"] = best_strat_name
+
+    # --- Verdict ---
+    src_acc_val = results["test1_source_acc"]
+    wd_acc_val = results.get("test2_wikidata_acc")
+
+    if src_acc_val < 0.50:
+        verdict = "CLEAN"
+    elif src_acc_val >= 0.70 and (wd_acc_val is None or wd_acc_val < 0.55):
+        verdict = "DIRTY"
+    elif src_acc_val >= 0.70 and wd_acc_val is not None and wd_acc_val >= 0.58:
+        verdict = "MIXED"
+    else:
+        verdict = "MIXED"
+
+    results["verdict"] = verdict
+
+    print(f"\n{'='*60}")
+    print("  CONFOUNDER AUDIT RESULTS")
+    print(f"{'='*60}")
+    print(f"  Test 1 — Source classifier:    {src_acc_val:.3f} (chance={results['test1_chance']:.3f})")
+    if wd_acc_val is not None:
+        print(f"  Test 2 — Wikidata-only probe:  {wd_acc_val:.3f} (N={results['test2_wikidata_n']})")
+    else:
+        print(f"  Test 2 — Wikidata-only probe:  SKIPPED (N={results.get('test2_wikidata_n', 0)})")
+    print(f"  Test 3 — Source-stratified:    {results['test3_stratified_acc']:.3f}")
+    print(f"  Verdict:                       {verdict}")
+    print(f"{'='*60}")
+
+    with open(RESULTS_CONFOUNDER_JSON, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"\n  Saved → {RESULTS_CONFOUNDER_JSON}")
+
+
+# ---------------------------------------------------------------------------
 # Option I: Fine-tune DINOv2
 # ---------------------------------------------------------------------------
 
@@ -3612,6 +3822,8 @@ def main():
                         help="Hold out all rows from this source for domain-shift evaluation")
     parser.add_argument("--legacy-cv", action="store_true",
                         help="Use legacy non-nested CV (for comparison with old results)")
+    parser.add_argument("--confounder-audit", action="store_true",
+                        help="Run confounder audit: source classifier + within-source probes")
     args = parser.parse_args()
     hires = args.hires
     model_name = args.model
@@ -3639,6 +3851,11 @@ def main():
         for f in CACHE_META.glob("aic_*.json"):
             f.unlink()
         print("[Refetch] Cleared cached data — will re-fetch from all sources")
+
+    # --confounder-audit: source confound analysis, exit
+    if args.confounder_audit:
+        confounder_audit()
+        return
 
     # --concat --probe: concatenate all three embedding sets, run probe, exit
     if args.concat:

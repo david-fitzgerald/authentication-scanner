@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scan import (
     classify_attribution,
     classify_rembrandt_group,
+    confounder_audit,
     dedup_by_phash,
     extract_iiif_id,
     met_artist_group,
@@ -364,4 +365,109 @@ class TestPermutationSanity:
         # On random data, should be significant < 10% of the time (expect ~5%)
         assert significant_count <= 0.10 * n_runs + 1, (
             f"Too many significant results on random data: {significant_count}/{n_runs}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Confounder audit
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not _has_sklearn, reason="scikit-learn not installed")
+class TestConfounderAudit:
+    """Smoke tests for confounder_audit() with synthetic data via monkeypatch."""
+
+    def _make_synthetic_data(self, tmp_path, n=200, source_signal=False):
+        """Create synthetic inventory CSV and embeddings NPZ."""
+        import csv as csv_mod
+
+        rng = np.random.RandomState(42)
+        sources = ["wikidata"] * (n - 40) + ["rijksmuseum"] * 20 + ["met"] * 20
+        groups = (["rembrandt_autograph"] * (n // 2)
+                  + ["rembrandt_circle"] * (n - n // 2))
+        obj_ids = [f"obj_{i}" for i in range(n)]
+
+        # Shuffle together
+        order = rng.permutation(n)
+        sources = [sources[i] for i in order]
+        groups = [groups[i] for i in order]
+        obj_ids = [obj_ids[i] for i in order]
+
+        # Write inventory CSV
+        inv_path = tmp_path / "metadata" / "inventory.csv"
+        inv_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(inv_path, "w", newline="") as f:
+            w = csv_mod.DictWriter(f, fieldnames=["obj_id", "source", "title",
+                                                   "creator", "date", "image_url",
+                                                   "artist_group", "attribution"])
+            w.writeheader()
+            for i in range(n):
+                w.writerow({"obj_id": obj_ids[i], "source": sources[i],
+                            "title": "", "creator": "", "date": "",
+                            "image_url": "", "artist_group": groups[i],
+                            "attribution": ""})
+
+        # Write embeddings NPZ — random features
+        emb_dim = 768
+        if source_signal:
+            # Inject strong source signal: shift mean by source
+            cls = rng.randn(n, emb_dim).astype(np.float32)
+            for i in range(n):
+                if sources[i] == "rijksmuseum":
+                    cls[i] += 3.0
+                elif sources[i] == "met":
+                    cls[i] -= 3.0
+        else:
+            cls = rng.randn(n, emb_dim).astype(np.float32)
+        patch = rng.randn(n, emb_dim).astype(np.float32)
+
+        emb_path = tmp_path / "embeddings" / "embeddings_entropy.npz"
+        emb_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(emb_path,
+                 painting_ids=np.array(obj_ids),
+                 artist_groups=np.array(groups),
+                 cls_embeddings=cls,
+                 patch_embeddings=patch)
+
+        return inv_path, emb_path
+
+    def test_confounder_audit_runs(self, tmp_path, monkeypatch):
+        """Smoke test: confounder_audit completes and writes JSON."""
+        import scan
+
+        inv_path, emb_path = self._make_synthetic_data(tmp_path)
+        results_path = tmp_path / "results_confounder.json"
+
+        monkeypatch.setattr(scan, "INVENTORY_CSV", inv_path)
+        monkeypatch.setattr(scan, "EMBEDDINGS_ENTROPY_NPZ", emb_path)
+        monkeypatch.setattr(scan, "RESULTS_CONFOUNDER_JSON", results_path)
+
+        confounder_audit()
+
+        assert results_path.exists()
+        import json
+        result = json.loads(results_path.read_text())
+        assert "verdict" in result
+        assert result["verdict"] in ("CLEAN", "MIXED", "DIRTY")
+        assert "test1_source_acc" in result
+        assert "test2_wikidata_acc" in result
+        assert "test3_stratified_acc" in result
+
+    def test_confounder_detects_source_signal(self, tmp_path, monkeypatch):
+        """When embeddings encode source strongly, source classifier acc should be high."""
+        import scan
+
+        inv_path, emb_path = self._make_synthetic_data(tmp_path, source_signal=True)
+        results_path = tmp_path / "results_confounder.json"
+
+        monkeypatch.setattr(scan, "INVENTORY_CSV", inv_path)
+        monkeypatch.setattr(scan, "EMBEDDINGS_ENTROPY_NPZ", emb_path)
+        monkeypatch.setattr(scan, "RESULTS_CONFOUNDER_JSON", results_path)
+
+        confounder_audit()
+
+        import json
+        result = json.loads(results_path.read_text())
+        # With +3.0 / -3.0 shifts, source classifier should nail it
+        assert result["test1_source_acc"] > 0.80, (
+            f"Source classifier should detect injected signal: {result['test1_source_acc']}"
         )
