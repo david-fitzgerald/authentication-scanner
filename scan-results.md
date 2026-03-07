@@ -1,6 +1,6 @@
 ---
-version: 0.9.0
-date: 2026-03-03
+version: 0.10.0
+date: 2026-03-07
 status: active
 ---
 
@@ -487,6 +487,59 @@ The similarity between CLIP (62.9%) and DINOv2 mean (59.0%) suggests both founda
 
 **Entropy-weighted DINOv2 is the clear winner.** All Tier 1 options (I, E, J, K) exhausted. None breaks 64%. The frozen-feature ceiling for Rembrandt autograph/circle classification is ~63.7% balanced accuracy. Next: Tier 2 (diagnostic regions, metadata hybrid) or Tier 3 (multi-artist transfer).
 
+## Confounder Audit: Is 63.7% Real or a Source Artifact?
+
+**Date:** 2026-03-07
+
+**Question:** The dataset has 3 sources (wikidata=664, met=34, rijksmuseum=13) with different photography pipelines. If the embeddings encode "which museum photographed this" rather than "brushwork style," the 63.7% balanced accuracy could be partially or fully spurious.
+
+### Test 1: Source Classifier
+
+Can a logistic regression predict which museum from the same entropy embeddings?
+
+| Metric | Value |
+|--------|-------|
+| Balanced accuracy | **64.5% ± 17.3%** |
+| Chance level | 33.3% (3 sources) |
+| Method | LogReg, PCA(20), 10-fold CV |
+
+Above chance but high variance. The embeddings encode *some* source signal — expected given different photography pipelines — but not strongly (< 70% threshold).
+
+### Test 2: Wikidata-Only Probe
+
+Eliminate cross-source confounds entirely by probing autograph vs circle within wikidata only (N=664, 533 auto + 131 circle).
+
+| Classifier | Balanced acc |
+|------------|-------------|
+| Logistic | 60.2% ± 6.2% |
+| **SVM RBF** | **63.0% ± 7.9%** |
+
+**The signal holds.** Wikidata-only SVM RBF (63.0%) is within 0.7% of the full-dataset result (63.7%). Removing the 47 museum paintings barely changes the classification — the attribution signal is encoded in the wikidata-sourced paintings themselves, not in cross-source photography differences.
+
+### Test 3: Source-Stratified Probe
+
+Standard 10-fold CV but with stratified folds preserving source proportions.
+
+| Classifier | Balanced acc |
+|------------|-------------|
+| Logistic | 59.6% ± 3.5% |
+| **SVM RBF** | **63.7% ± 6.3%** |
+
+Identical to the non-stratified result (63.7%). Source proportions in CV folds don't matter because the signal isn't source-dependent.
+
+### Verdict: MIXED (best-case)
+
+| Test | Result | Interpretation |
+|------|--------|---------------|
+| Source classifier | 64.5% | Mild source encoding exists (expected) |
+| Wikidata-only | 63.0% | Signal holds within single source |
+| Source-stratified | 63.7% | Unchanged from original result |
+| **Verdict** | **MIXED** | Source shortcut exists but attribution signal is real |
+
+The 63.7% balanced accuracy is not a source artifact. The attribution signal survives complete elimination of cross-source confounds (Test 2). The mild source encoding (Test 1) is a separate, weaker signal that doesn't inflate the probe results.
+
+**Implication:** Safe to proceed to Tier 3 experiments without deconfounding. The frozen-feature ceiling of 63.7% reflects genuine (if weak) attribution signal in DINOv2 entropy-weighted embeddings.
+
 ## Files
 
 | File | What |
@@ -503,6 +556,7 @@ The similarity between CLIP (62.9%) and DINOv2 mean (59.0%) suggests both founda
 | `cache/results_finetune.json` | v1-I fine-tune metrics |
 | `cache/results_tiles.json` | v1-E per-tile probe metrics |
 | `cache/results_clip.json` | v1-J CLIP probe metrics |
+| `cache/results_confounder.json` | Confounder audit results (source classifier + within-source probes) |
 | `cache/embeddings/embeddings_tiles.npz` | Per-tile CLS embeddings (37K tiles, 106MB) |
 | `cache/embeddings/embeddings_clip.npz` | CLIP ViT-L/14 embeddings (768d) |
 | `cache/plots/` | UMAP, cosine, heatmap for latest run |
