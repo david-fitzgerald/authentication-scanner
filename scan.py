@@ -2424,11 +2424,11 @@ def robustness_test():
     patch_emb = data["patch_embeddings"]
 
     # Filter to autograph + circle
-    mask = np.isin(artist_groups, ["autograph", "circle"])
+    mask = np.isin(artist_groups, ["rembrandt_autograph", "rembrandt_circle"])
     painting_ids = painting_ids[mask]
     artist_groups = artist_groups[mask]
     full_emb = np.concatenate([cls_emb[mask], patch_emb[mask]], axis=1)
-    labels = (artist_groups == "autograph").astype(int)  # 1=autograph, 0=circle
+    labels = (artist_groups == "rembrandt_autograph").astype(int)  # 1=autograph, 0=circle
 
     N = len(painting_ids)
     print(f"  Paintings: {N} (autograph={labels.sum()}, circle={N - labels.sum()})")
