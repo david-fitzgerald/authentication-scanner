@@ -81,19 +81,16 @@ echo "========================================"
 echo "  Starting experiments — $(date -u '+%H:%M:%S UTC')"
 echo "========================================"
 
-# --- Tier 3 experiments (re-run C/D/A) ---
-
-# Experiment C: LoRA leave-artist-out (~30-45min)
-echo ""
-echo "[EXP C] LoRA leave-artist-out..."
-python3 scan.py --lora-transfer 2>&1
-echo "[EXP C] Done — $(date -u '+%H:%M:%S UTC')"
+# --- Tier 3 experiments (D/A only — C killed, see CLAUDE.md) ---
 
 # Experiment D: Two-phase curriculum (~20-30min)
 echo ""
 echo "[EXP D] Two-phase LoRA curriculum..."
 python3 scan.py --lora-curriculum 2>&1
 echo "[EXP D] Done — $(date -u '+%H:%M:%S UTC')"
+
+# Clear GPU memory between experiments
+python3 -c "import torch; torch.cuda.empty_cache(); print('[GPU] Cache cleared')"
 
 # Experiment A: Frozen transfer probe (~5min)
 echo ""
