@@ -46,6 +46,11 @@ for i in $(seq 1 60); do
     sleep 5
 done
 
+# --- Ensure SSH access ---
+apt-get install -yq openssh-server 2>/dev/null || true
+systemctl enable ssh
+systemctl start ssh
+
 # --- Setup workspace ---
 mkdir -p "${WORK}/cache"
 
@@ -69,7 +74,7 @@ python3 -c "import torch; print(f'[CUDA] PyTorch {torch.__version__}, CUDA: {tor
 # --- Run experiments ---
 cd "${WORK}"
 RESULTS_DIR="${WORK}/cache"
-export CUDA_LAUNCH_BLOCKING=1
+export PYTHONUNBUFFERED=1
 
 echo ""
 echo "========================================"

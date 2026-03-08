@@ -107,7 +107,8 @@ gcloud compute instances create "${INSTANCE}" \
     --boot-disk-type=pd-ssd \
     --scopes=storage-full \
     --metadata-from-file=startup-script="${STARTUP}" \
-    --metadata=bucket="${BUCKET}"
+    --metadata=bucket="${BUCKET}" \
+    --tags=auth-experiments
 
 echo ""
 echo "=== VM Created ==="

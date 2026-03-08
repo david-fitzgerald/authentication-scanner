@@ -1,8 +1,8 @@
 ---
-version: 0.3.1
+version: 0.3.2
 status: building
 harness: L1
-updated: 2026-03-05
+updated: 2026-03-07
 ---
 
 # Authentication — Claude Instructions
@@ -40,6 +40,7 @@ AI-driven art authentication via DINOv2 embeddings. Collection-scale screening �
 | `deploy-gpu.sh` | GCE Spot T4 launcher. Creates VM, uploads cache, runs experiments, self-destructs. |
 | `startup-gpu.sh` | VM startup script. Installs deps, runs experiments, uploads results to GCS. |
 | `prototype.ipynb` | Phase 1 prototype. DINOv2 embedding pipeline on Rijksmuseum Rembrandt corpus. Run on Colab Pro (T4). |
+| `adjacent-angles.md` | Grounded assessment of 10 extensions. Tiered by priority. Confounder audit is #1. |
 | `scan-results.md` | Local pipeline results. v1 vs v2 comparison, key findings, next steps (C/D/E/F). |
 | `prototype-results.md` | Colab prototype results. Original Rijksmuseum-only metrics + API discoveries. |
 | `research.md` | Opportunity landscape — art authentication + lost manuscripts, six gaps, monetisation paths |
@@ -76,6 +77,8 @@ AI-driven art authentication via DINOv2 embeddings. Collection-scale screening �
 | 2026-03-05 | GCE Spot T4 deployed | scan.py CUDA-portable (10 edits). deploy-gpu.sh + startup-gpu.sh created. Transfer corpus: 5,859 paintings embedded. |
 | 2026-03-05 | EXP B (LoRA Rembrandt): 60.9% ± 3.5% | Worse than frozen entropy (63.7%). LoRA with 148K params didn't help. |
 | 2026-03-06 | EXP C crashed (CUDA error) | Cranach fold only (53.4%). Spot VM preempted on retry. Redeployed on-demand `europe-west4-a`. |
+| 2026-03-07 | Deploy fix: CUDA_LAUNCH_BLOCKING removed | Was causing silent hang (3.5h no output). Replaced with PYTHONUNBUFFERED=1. |
+| 2026-03-07 | Deploy fix: SSH access | VM missing `finance-scanner` network tag for IAP firewall rule. Added `--tags=auth-experiments` to deploy-gpu.sh. |
 
 ## Verification
 
@@ -90,20 +93,35 @@ ruff check . && pytest tests/ -x -q --tb=short
 
 ## Next Session
 
-**Tier 3 experiments C/D/A running on GCE on-demand T4** (`auth-experiments`, `europe-west4-a`).
-VM started ~Mar 6 afternoon UTC, 36h cap. On-demand (Spot kept getting preempted/exhausted in US zones).
-`CUDA_LAUNCH_BLOCKING=1` set to prevent async CUDA errors that crashed EXP C on the first run.
+**T4 VM deployed 2026-03-07 ~03:00 UTC.** Running EXP C/D/A + methodological probes. ETA completion ~06:30-07:30 UTC. VM self-destructs after uploading to GCS.
+
+### Currently running (deploy 2026-03-07)
+1. **EXP C** (LoRA leave-artist-out) — 50 epochs × 6 folds, started 03:00 UTC, GPU 99%
+2. **EXP D** (two-phase curriculum) — queued after C
+3. **EXP A** (frozen transfer probe) — queued, ~5min
+4. **Methodological probes** — nested CV, strict labels, legacy CV, Met holdout
 
 ### Results so far
 - **EXP 0** (transfer embed): Done. 5,859 paintings embedded.
 - **EXP B** (LoRA Rembrandt): **60.9% ± 3.5%** — worse than frozen entropy (63.7%). LoRA didn't help.
-- **EXP C** (LoRA leave-artist-out): Running (crashed first attempt at cranach fold: 53.4%, CUDA error).
-- **EXP D** (two-phase curriculum): Queued after C.
-- **EXP A** (frozen transfer probe): Queued after D. Fast (~5min).
+- **EXP C** (LoRA leave-artist-out): Running (first successful deploy after 2 crashes + 1 silent hang).
+- **EXP D/A**: Queued.
+
+### Methodological fixes shipped (v0.3.2)
+- Fix 1: Label confidence (high/medium/low) propagated to all rows
+- Fix 2a: Perceptual dedup via imagehash (average hash 16x16, threshold=10)
+- Fix 2b: Uniform preprocessing — all sources capped at IMG_MAX_PX
+- Fix 3: Nested CV (outer 10-fold, inner 5-fold) replaces non-nested grid search
+- Fix 4: `--holdout-source` institution holdout diagnostic
+- Fix 5: 44 tests (split integrity, label confidence, nested CV, permutation sanity)
+- Fix 6: Exp A reporting reorder (A2 leave-artist-out as primary metric)
+
+### Adjacent angles (review pending)
+See `adjacent-angles.md`. Confounder audit (source classifier on embeddings, 2h) is highest leverage.
 
 ### Check results
 1. Check VM: `gcloud compute instances describe auth-experiments --zone=europe-west4-a --project=perpstrader --format='value(status)' 2>&1`
-2. SSH monitor: `gcloud compute ssh auth-experiments --zone=europe-west4-a -- tail -50 /var/log/auth-experiments.log`
+2. SSH monitor (via IAP): `gcloud compute ssh auth-experiments --zone=europe-west4-a --tunnel-through-iap -- tail -50 /var/log/auth-experiments.log`
 3. Check GCS results: `gsutil ls gs://auth-ml-cache/results/`
 4. Pull results: `gsutil -m rsync -r gs://auth-ml-cache/results/ cache/`
 5. Emergency stop: `gcloud compute instances delete auth-experiments --zone=europe-west4-a --quiet`
