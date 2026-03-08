@@ -698,6 +698,65 @@ Three distinct stories:
 
 **VARIABLE.** The signal partially generalises across museum sources but with degraded circle recall. The reverse direction (wikidata→rest, 62.5%) is the key result — close enough to baseline to suggest the model captures some genuine stylistic signal, not just source-specific photography artifacts. However, the asymmetry (high autograph recall, low circle recall across all conditions) suggests the model's "autograph" signal is more robust than its "circle" signal.
 
+## Multimodal Probe: Do Dimensions, Material, and Dates Help?
+
+Concat metadata features (dimensions, material, date) with DINOv2 entropy-weighted embeddings. Tests whether physical/temporal priors improve the 63.7% baseline. Real value is interpretability ("flagged because small painting on panel with borderline embedding score"), not raw accuracy.
+
+### Metadata Coverage
+
+| Field | Coverage |
+|-------|----------|
+| Dimensions (H×W) | 90.7% |
+| Material | 94.7% |
+| Inception date | 94.4% |
+
+Sources: Wikidata SPARQL (1203 paintings), Met API (52), Rijksmuseum Linked Art (56). 12 Rijksmuseum objects returned 404 — internal IDs no longer in their Linked Art endpoint.
+
+### Features (8 total)
+
+| # | Feature | Derivation | Missing strategy |
+|---|---------|-----------|-----------------|
+| 1 | `log_area_cm2` | log(height × width) | Median impute |
+| 2 | `is_panel` | "panel" or "wood" in medium | 0 |
+| 3 | `is_canvas` | "canvas" in medium | 0 |
+| 4 | `date_midpoint` | (begin + end) / 2 | Median impute |
+| 5 | `date_range` | end − begin | 0 |
+| 6 | `has_dimensions` | 1 if h and w present | Always known |
+| 7 | `has_date` | 1 if begin_year present | Always known |
+| 8 | `title_word_count` | len(title.split()) | Always known |
+
+### Results
+
+| Variant | Bal Acc | Rec(auto) | Rec(circle) | Notes |
+|---------|---------|-----------|-------------|-------|
+| Embeddings only | 63.7% | 73.1% | 54.4% | Reproduces baseline exactly |
+| Metadata only | 61.5% | 83.5% | 39.6% | Strong autograph recall, weak circle |
+| Embeddings + metadata | **64.5%** | 74.6% | 54.4% | p=0.005 (permutation test, 200 perms) |
+
+### Feature Importances (Logistic Regression on Metadata Only)
+
+| Feature | Coefficient | Interpretation |
+|---------|------------|----------------|
+| `date_range` | −1.231 | Strongest signal. Larger date uncertainty → circle. Makes sense: autograph paintings have precise dates. |
+| `date_midpoint` | −0.373 | Earlier works slightly more likely circle (corpus composition effect?) |
+| `has_dimensions` | +0.302 | Metadata availability correlates with autograph (better-documented paintings) |
+| `has_date` | −0.266 | Opposite direction to `has_dimensions` — interaction effect |
+| `log_area_cm2` | +0.222 | Larger paintings slightly more likely autograph |
+| `is_panel` | +0.108 | Panel support → slightly more likely autograph |
+| `is_canvas` | −0.038 | Near zero — canvas is neutral |
+| `title_word_count` | −0.003 | No signal |
+
+### Interpretation
+
+1. **Metadata alone carries real signal (61.5%).** Date range is the dominant feature — Rembrandt autograph works have precise dates from centuries of scholarship, while workshop/circle attributions carry more date uncertainty. This is a proxy for attribution confidence, not a physical property.
+2. **Combined model gains +0.7pp (63.7% → 64.5%).** Statistically significant (p=0.005) but below the 1pp threshold for IMPROVED verdict. The metadata features add marginal, non-redundant information.
+3. **Circle recall unchanged at 54.4%.** The metadata doesn't help identify circle paintings — the gain comes from slightly better autograph recall (73.1% → 74.6%).
+4. **Interpretability value confirmed.** A flagging system could report "flagged because: small panel painting, uncertain date range, borderline embedding score" — richer than embedding distance alone.
+
+### Verdict
+
+**NEUTRAL.** +0.7pp is real but marginal. The biggest insight: `date_range` as a signal is mostly reflecting attribution confidence (well-studied autographs get precise dates), not a causal feature. Metadata features are worth including in a production flagging system for interpretability, not accuracy.
+
 ## Files
 
 | File | What |
@@ -719,6 +778,8 @@ Three distinct stories:
 | `cache/results_calibration.json` | Calibration + abstention results (decision-function thresholds) |
 | `cache/results_hard_negatives.json` | Hard-negative mining results (per-subset recall + permutation test) |
 | `cache/results_domain_shift.json` | Domain-shift holdout results (per-source recall + reverse direction) |
+| `cache/results_multimodal.json` | Multimodal probe results (3 variants, coverage, feature importances) |
+| `cache/metadata/inventory_enriched.csv` | Enriched inventory with dimensions, material, dates (14 columns) |
 | `cache/embeddings/embeddings_tiles.npz` | Per-tile CLS embeddings (37K tiles, 106MB) |
 | `cache/embeddings/embeddings_clip.npz` | CLIP ViT-L/14 embeddings (768d) |
 | `cache/plots/` | UMAP, cosine, heatmap for latest run |
