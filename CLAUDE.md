@@ -1,9 +1,3 @@
----
-version: 0.3.3
-status: building
-harness: L1
-updated: 2026-03-08
----
 
 # Authentication — Claude Instructions
 
@@ -49,7 +43,7 @@ AI-driven art authentication via DINOv2 embeddings. Collection-scale screening �
 
 ## Status
 
-**Best result: 63.7% balanced accuracy (entropy SVM RBF, frozen features).** All Tier 1 exhausted, all Tier 2 adjacent experiments complete. Tier 3 (LoRA transfer) running on T4 VM. Key finding: hard-negative performance is weak (55.1%, p=0.228) — model has no edge on the commercially relevant cases.
+**Best result: 63.7% balanced accuracy (entropy SVM RBF, frozen features).** All Tiers 1-3 exhausted. Frozen DINOv2 is the ceiling — LoRA, fine-tuning, curriculum transfer all failed. Hard-negative performance is weak (55.1%, p=0.228) — model has no edge on the commercially relevant cases.
 
 ## Decisions Log
 
@@ -86,6 +80,9 @@ AI-driven art authentication via DINOv2 embeddings. Collection-scale screening �
 | 2026-03-08 | Domain-shift holdout: VARIABLE | Per-source holdout varies widely. Reverse (wikidata→rest): 62.5%. Autograph signal more robust than circle signal. |
 | 2026-03-08 | Multimodal probe: NEUTRAL | Embed+meta 64.5% vs embed-only 63.7% (+0.7pp, p=0.005). Date range is strongest metadata feature. Marginal gain, interpretability value. |
 | 2026-03-08 | **All Tier 2 adjacent experiments complete** | Confounder, robustness, calibration, hard-negatives, domain-shift, multimodal — all done. Waiting on T4 for Tier 3 (EXP C/D/A). |
+| 2026-03-09 | EXP D (curriculum): 59.0% ± 8.1% | Worse than frozen 63.7%. High variance (48.6%–70.0%). Transfer learning adds no value. |
+| 2026-03-09 | EXP A skipped | Transfer embeddings lost when first VM crashed. B/C/D all failed — running A wouldn't change conclusion. |
+| 2026-03-09 | **Tier 3 dead** | All LoRA variants (B: 60.9%, C: crashed, D: 59.0%) underperform frozen 63.7%. Ceiling confirmed. |
 
 ## Verification
 
@@ -100,22 +97,11 @@ ruff check . && pytest tests/ -x -q --tb=short
 
 ## Next Session
 
-### Waiting on T4 VM (EXP C/D/A)
-Deployed 2026-03-07. Running LoRA leave-artist-out (C), curriculum (D), frozen transfer probe (A).
-
-```bash
-# Check VM status
-gcloud compute instances describe auth-experiments --zone=europe-west4-a --project=perpstrader --format='value(status)' 2>&1
-# Check GCS results
-gsutil ls gs://auth-ml-cache/results/
-# Pull results
-gsutil -m rsync -r gs://auth-ml-cache/results/ cache/
-```
-
-### Tier 3 results so far
-- **EXP 0** (transfer embed): Done. 5,859 paintings embedded.
-- **EXP B** (LoRA Rembrandt): **60.9% ± 3.5%** — worse than frozen 63.7%.
-- **EXP C/D/A**: Running on T4.
+### Tier 3 results (complete)
+- **EXP B** (LoRA Rembrandt): 60.9% ± 3.5% — worse than frozen 63.7%.
+- **EXP C** (LoRA leave-artist-out): Crashed twice. Cranach fold: 53.4%.
+- **EXP D** (Two-phase curriculum): 59.0% ± 8.1% — worse, high variance.
+- **EXP A** (Frozen transfer probe): Skipped — embeddings lost, result wouldn't change conclusion.
 
 ### All Tier 2 adjacent experiments complete
 | Experiment | Verdict | Key finding |

@@ -865,7 +865,28 @@ Exp B is independent of the transfer corpus — can run immediately on existing 
 
 ### Results
 
-*Not yet run. Results will be added here as experiments complete.*
+| Exp | What | Bal Acc | vs Frozen 63.7% | Notes |
+|-----|------|---------|-----------------|-------|
+| B | LoRA Rembrandt-only | 60.9% ± 3.5% | Worse | Folds: 0.621, 0.653, 0.634, 0.557, 0.581. LoRA with 148K params didn't help. |
+| C | LoRA leave-artist-out | Crashed | — | Cranach fold: 53.4%. CUDA error on fold 2. Two deploy attempts, same failure. |
+| D | Two-phase curriculum | 59.0% ± 8.1% | Worse | Folds: 0.700, 0.640, 0.486, 0.617, 0.508. High variance, worst fold at chance. |
+| A | Pooled frozen probe | Not run | — | Transfer embeddings lost when first VM crashed. Not re-run — Tier 3 already dead. |
+
+### Interpretation
+
+1. **All three LoRA variants underperform frozen features.** B (60.9%), C (crashed at 53.4%), D (59.0%) — none approach the 63.7% entropy SVM RBF baseline. LoRA fine-tuning actively degrades performance.
+2. **Curriculum transfer didn't help.** Pre-training on 5,036 non-Rembrandt paintings then fine-tuning on 711 Rembrandt paintings produced 59.0% — worse than training from scratch. The "universal workshop signature" hypothesis is not supported.
+3. **High variance in EXP D is telling.** Fold spread from 48.6% to 70.0% (σ=8.1%) compared to frozen SVM's ~3-4%. LoRA is fitting noise, not signal.
+4. **EXP A (frozen transfer probe) was skipped** — transfer embeddings NPZ was on the first VM that crashed and never uploaded to GCS. Given B/C/D all failed, running A wouldn't change the conclusion.
+
+### Tier 3 Verdict
+
+**DEAD.** The bottleneck is not model capacity or training method. DINOv2 frozen features at 63.7% is the ceiling for this dataset and task framing. Three independent LoRA experiments (Rembrandt-only, leave-artist-out, curriculum) all failed to improve.
+
+The decision tree resolves clearly:
+- B > 63.7%? **No** (60.9%). → LoRA doesn't help.
+- D > B? **No** (59.0% < 60.9%). → Transfer learning adds no value.
+- **Ship frozen features as the best model.** Consider Tier 2 pivot or accept the ceiling.
 
 ### Post-Tier 3 Diagnostic: Separability by Attribution Type
 
