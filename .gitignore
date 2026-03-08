@@ -6,5 +6,10 @@ __pycache__/
 # Cache
 cache/
 
+# Test / Lint
+.pytest_cache/
+*.egg-info/
+.ruff_cache/
+
 # OS
 .DS_Store
