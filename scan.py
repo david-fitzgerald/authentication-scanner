@@ -2563,14 +2563,13 @@ def robustness_test():
 # ---------------------------------------------------------------------------
 
 def calibration_test():
-    """Calibrated probabilities + abstention threshold sweep.
+    """Decision-function abstention threshold sweep.
 
-    Wrap best SVM RBF in CalibratedClassifierCV (isotonic, cv=10),
-    sweep abstention thresholds, report accuracy-vs-coverage tradeoff.
+    Collect OOF decision_function values via 10-fold CV, then sweep
+    |d(x)| thresholds — higher distance from hyperplane = more confident.
     """
-    from sklearn.calibration import CalibratedClassifierCV
     from sklearn.decomposition import PCA
-    from sklearn.metrics import balanced_accuracy_score, brier_score_loss
+    from sklearn.metrics import balanced_accuracy_score, recall_score
     from sklearn.model_selection import StratifiedKFold
     from sklearn.svm import SVC
 
@@ -2596,76 +2595,63 @@ def calibration_test():
     pca = PCA(n_components=20, random_state=42)
     X = pca.fit_transform(X_all)
 
-    # Collect out-of-fold calibrated probabilities via 10-fold CV
+    # Collect out-of-fold decision_function values + predictions via 10-fold CV
     outer_cv = StratifiedKFold(n_splits=10, shuffle=True, random_state=42)
-    oof_probs = np.zeros(n)
+    oof_decision = np.zeros(n)
     oof_preds = np.zeros(n, dtype=int)
 
-    for fold, (train_idx, test_idx) in enumerate(outer_cv.split(X, y)):
-        base_clf = SVC(kernel="rbf", C=1.0, gamma="scale", class_weight="balanced")
-        cal_clf = CalibratedClassifierCV(base_clf, cv=5, method="isotonic")
-        cal_clf.fit(X[train_idx], y[train_idx])
-        probs = cal_clf.predict_proba(X[test_idx])
-        oof_probs[test_idx] = probs[:, 1]  # P(autograph)
-        oof_preds[test_idx] = cal_clf.predict(X[test_idx])
+    for train_idx, test_idx in outer_cv.split(X, y):
+        clf = SVC(kernel="rbf", C=1.0, gamma="scale", class_weight="balanced")
+        clf.fit(X[train_idx], y[train_idx])
+        oof_decision[test_idx] = clf.decision_function(X[test_idx])
+        oof_preds[test_idx] = clf.predict(X[test_idx])
 
     # Baseline balanced accuracy (no abstention)
     baseline_bal_acc = balanced_accuracy_score(y, oof_preds)
-    brier = brier_score_loss(y, oof_probs)
 
-    # ECE (expected calibration error, 10 bins)
-    n_bins = 10
-    bin_edges = np.linspace(0, 1, n_bins + 1)
-    ece = 0.0
-    for i in range(n_bins):
-        in_bin = (oof_probs >= bin_edges[i]) & (oof_probs < bin_edges[i + 1])
-        if in_bin.sum() == 0:
-            continue
-        avg_conf = oof_probs[in_bin].mean()
-        avg_acc = y[in_bin].mean()
-        ece += in_bin.sum() * abs(avg_conf - avg_acc)
-    ece /= n
+    # Sweep |decision_function| abstention thresholds
+    thresholds = [0.0, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0, 1.5, 2.0]
+    decision_thresholds = []
 
-    # Sweep abstention thresholds
-    thresholds = [t / 100.0 for t in range(50, 100, 5)]
-    sweep_results = []
-
-    print(f"\n  {'Threshold':>10}  {'Coverage':>10}  {'Accuracy':>10}  {'Called/Total':>14}")
+    print(f"\n  Baseline balanced accuracy: {baseline_bal_acc:.4f}")
+    print(f"\n  {'|d(x)| thresh':>14}  {'Coverage':>10}  {'Bal Acc':>10}"
+          f"  {'Rec(auto)':>10}  {'Rec(circle)':>12}  {'Called':>8}")
     for thresh in thresholds:
-        # Abstain if max(P(class0), P(class1)) < threshold
-        max_prob = np.maximum(oof_probs, 1 - oof_probs)
-        called_mask = max_prob >= thresh
+        called_mask = np.abs(oof_decision) >= thresh
         n_called = int(called_mask.sum())
         coverage = n_called / n
 
-        if n_called == 0:
-            acc = 0.0
+        if n_called == 0 or len(np.unique(y[called_mask])) < 2:
+            bal_acc = 0.0
+            rec_auto = 0.0
+            rec_circle = 0.0
         else:
-            acc = balanced_accuracy_score(y[called_mask], oof_preds[called_mask])
+            y_sub = y[called_mask]
+            p_sub = oof_preds[called_mask]
+            bal_acc = balanced_accuracy_score(y_sub, p_sub)
+            rec_auto = recall_score(y_sub, p_sub, pos_label=1)
+            rec_circle = recall_score(y_sub, p_sub, pos_label=0)
 
-        sweep_results.append({
+        decision_thresholds.append({
             "threshold": thresh,
             "coverage_pct": round(coverage * 100, 1),
-            "accuracy_pct": round(acc * 100, 1),
+            "bal_acc_pct": round(bal_acc * 100, 1),
+            "recall_auto_pct": round(rec_auto * 100, 1),
+            "recall_circle_pct": round(rec_circle * 100, 1),
             "n_called": n_called,
             "n_total": n,
         })
-        print(f"  {thresh:>10.2f}  {coverage*100:>9.1f}%  {acc*100:>9.1f}%  {n_called:>6}/{n}")
+        print(f"  {thresh:>14.2f}  {coverage*100:>9.1f}%  {bal_acc*100:>9.1f}%"
+              f"  {rec_auto*100:>9.1f}%  {rec_circle*100:>11.1f}%  {n_called:>8}")
 
     print(f"\n{'=' * 60}")
-    print(f"  Brier score: {brier:.4f}")
-    print(f"  ECE (10-bin): {ece:.4f}")
-    print(f"  Baseline balanced accuracy: {baseline_bal_acc:.4f}")
-    print(f"{'=' * 60}")
 
     output = {
         "n_total": n,
         "n_autograph": int(y.sum()),
         "n_circle": n - int(y.sum()),
         "baseline_bal_acc": round(baseline_bal_acc, 4),
-        "brier_score": round(brier, 4),
-        "ece_10bin": round(ece, 4),
-        "sweep": sweep_results,
+        "decision_thresholds": decision_thresholds,
     }
     with open(RESULTS_CALIBRATION_JSON, "w") as f:
         json.dump(output, f, indent=2)
@@ -2680,11 +2666,13 @@ def hard_negative_test():
     """Test discrimination on circle paintings most similar to autographs.
 
     Compute cosine similarity, rank circle by hardness, re-run probe
-    on progressively harder subsets.
+    on progressively harder subsets. Reports per-class recall and
+    permutation test on top-25%.
     """
     from sklearn.decomposition import PCA
+    from sklearn.metrics import balanced_accuracy_score, recall_score
     from sklearn.metrics.pairwise import cosine_similarity
-    from sklearn.model_selection import StratifiedKFold, cross_val_score
+    from sklearn.model_selection import StratifiedKFold, permutation_test_score
     from sklearn.svm import SVC
 
     print("\n" + "=" * 60)
@@ -2728,26 +2716,19 @@ def hard_negative_test():
     percentiles = [100, 75, 50, 25]
     subset_results = []
 
-    # Full-dataset baseline
-    y_full = (groups == "rembrandt_autograph").astype(int)
-    pca_full = PCA(n_components=20, random_state=42)
-    X_full_pca = pca_full.fit_transform(X_all)
-    skf = StratifiedKFold(n_splits=10, shuffle=True, random_state=42)
-    baseline_scores = cross_val_score(
-        SVC(kernel="rbf", C=1.0, gamma="scale", class_weight="balanced"),
-        X_full_pca, y_full, cv=skf, scoring="balanced_accuracy")
-    baseline_acc = baseline_scores.mean()
+    circle_global_idx = np.where(circle_mask)[0]
+    auto_global_idx = np.where(auto_mask)[0]
 
-    print(f"\n  {'Subset':<20} {'N_circle':>10} {'Bal Acc':>10} {'vs Full':>10}")
+    print(f"\n  {'Subset':<15} {'N_circ':>7} {'Bal Acc':>9} {'Raw Acc':>9}"
+          f" {'Rec(auto)':>10} {'Rec(circ)':>10} {'vs Full':>9}")
+
+    baseline_acc = None
 
     for pct in percentiles:
         n_keep = max(1, int(n_circle * pct / 100))
         hard_indices = hardness_order[:n_keep]
 
         # Build subset: all autographs + selected hard circle paintings
-        # Get indices into X_all
-        circle_global_idx = np.where(circle_mask)[0]
-        auto_global_idx = np.where(auto_mask)[0]
         subset_idx = np.concatenate([auto_global_idx, circle_global_idx[hard_indices]])
 
         X_sub = X_all[subset_idx]
@@ -2756,33 +2737,75 @@ def hard_negative_test():
         n_sub_circle = n_keep
         n_sub = len(y_sub)
 
-        # Need enough samples for 10-fold CV
+        # Need enough samples for stratified CV
         n_splits = min(10, min(int(y_sub.sum()), n_sub - int(y_sub.sum())))
         if n_splits < 2:
             acc = float("nan")
+            raw_acc = float("nan")
+            rec_auto = float("nan")
+            rec_circle = float("nan")
             delta = float("nan")
         else:
             pca_sub = PCA(n_components=min(20, n_sub - 1), random_state=42)
             X_sub_pca = pca_sub.fit_transform(X_sub)
             skf_sub = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
-            scores = cross_val_score(
-                SVC(kernel="rbf", C=1.0, gamma="scale", class_weight="balanced"),
-                X_sub_pca, y_sub, cv=skf_sub, scoring="balanced_accuracy")
-            acc = scores.mean()
+
+            # Manual OOF loop for per-class recall
+            oof_preds = np.zeros(n_sub, dtype=int)
+            for train_idx, test_idx in skf_sub.split(X_sub_pca, y_sub):
+                clf = SVC(kernel="rbf", C=1.0, gamma="scale", class_weight="balanced")
+                clf.fit(X_sub_pca[train_idx], y_sub[train_idx])
+                oof_preds[test_idx] = clf.predict(X_sub_pca[test_idx])
+
+            acc = balanced_accuracy_score(y_sub, oof_preds)
+            raw_acc = float((oof_preds == y_sub).mean())
+            rec_auto = recall_score(y_sub, oof_preds, pos_label=1)
+            rec_circle = recall_score(y_sub, oof_preds, pos_label=0)
+
+            if baseline_acc is None:
+                baseline_acc = acc
             delta = acc - baseline_acc
 
         label = f"Top {pct}%" if pct < 100 else "All circle"
-        print(f"  {label:<20} {n_sub_circle:>10} {acc*100:>9.1f}% {delta*100:>+9.1f}%")
+        print(f"  {label:<15} {n_sub_circle:>7} {acc*100:>8.1f}% {raw_acc*100:>8.1f}%"
+              f" {rec_auto*100:>9.1f}% {rec_circle*100:>9.1f}% {delta*100:>+8.1f}%")
 
-        subset_results.append({
+        result_entry = {
             "percentile": pct,
             "n_circle": n_sub_circle,
             "bal_acc": round(acc, 4) if not np.isnan(acc) else None,
+            "raw_acc": round(raw_acc, 4) if not np.isnan(raw_acc) else None,
+            "recall_auto": round(rec_auto, 4) if not np.isnan(rec_auto) else None,
+            "recall_circle": round(rec_circle, 4) if not np.isnan(rec_circle) else None,
             "delta_vs_full": round(delta, 4) if not np.isnan(delta) else None,
-        })
+        }
+        subset_results.append(result_entry)
+
+    # Permutation test on top-25% subset
+    top25_entry = subset_results[-1]
+    perm_p = None
+    if top25_entry["bal_acc"] is not None:
+        n_keep_25 = max(1, int(n_circle * 25 / 100))
+        hard_25 = hardness_order[:n_keep_25]
+        sub25_idx = np.concatenate([auto_global_idx, circle_global_idx[hard_25]])
+        X_25 = X_all[sub25_idx]
+        y_25 = (groups[sub25_idx] == "rembrandt_autograph").astype(int)
+        n_25 = len(y_25)
+        n_splits_25 = min(10, min(int(y_25.sum()), n_25 - int(y_25.sum())))
+        if n_splits_25 >= 2:
+            pca_25 = PCA(n_components=min(20, n_25 - 1), random_state=42)
+            X_25_pca = pca_25.fit_transform(X_25)
+            skf_25 = StratifiedKFold(n_splits=n_splits_25, shuffle=True, random_state=42)
+            _, _, perm_p_val = permutation_test_score(
+                SVC(kernel="rbf", C=1.0, gamma="scale", class_weight="balanced"),
+                X_25_pca, y_25, cv=skf_25, scoring="balanced_accuracy",
+                n_permutations=200, random_state=42)
+            perm_p = round(float(perm_p_val), 4)
+            top25_entry["perm_p"] = perm_p
+            print(f"\n  Top-25% permutation test (200 perms): p={perm_p}")
 
     # Verdict
-    top25_acc = subset_results[-1]["bal_acc"]
+    top25_acc = top25_entry["bal_acc"]
     if top25_acc is None or top25_acc < 0.50:
         verdict = "COLLAPSED"
     elif top25_acc < 0.55:
@@ -2803,7 +2826,7 @@ def hard_negative_test():
             "min": round(float(max_sim.min()), 4),
             "max": round(float(max_sim.max()), 4),
         },
-        "baseline_bal_acc": round(baseline_acc, 4),
+        "baseline_bal_acc": round(baseline_acc, 4) if baseline_acc is not None else None,
         "subsets": subset_results,
         "verdict": verdict,
     }
@@ -2820,11 +2843,13 @@ def domain_shift_test():
     """Train on all sources except one, test on held-out source.
 
     For each source with >=10 paintings in {autograph, circle},
-    train on all other sources, test on held-out.
+    train on all other sources, test on held-out. Flags unreliable
+    results (test N<5 in either class), adds reverse direction
+    (largest source → rest), and reports per-class recall.
     """
     import csv as csv_mod
     from sklearn.decomposition import PCA
-    from sklearn.metrics import balanced_accuracy_score
+    from sklearn.metrics import balanced_accuracy_score, recall_score
     from sklearn.svm import SVC
 
     print("\n" + "=" * 60)
@@ -2866,7 +2891,8 @@ def domain_shift_test():
     unique_sources = sorted(set(sources))
     source_results = []
 
-    print(f"\n  {'Source':<20} {'N_auto':>8} {'N_circle':>10} {'Bal Acc':>10} {'Train N':>10}")
+    print(f"\n  {'Source':<20} {'N_auto':>7} {'N_circ':>7} {'Bal Acc':>9}"
+          f" {'Rec(auto)':>10} {'Rec(circ)':>10} {'Train N':>8} {'Flag':>20}")
 
     for src in unique_sources:
         src_mask = sources == src
@@ -2896,22 +2922,80 @@ def domain_shift_test():
         clf.fit(X_train, y[train_mask])
         preds = clf.predict(X_test)
         acc = balanced_accuracy_score(y[src_mask], preds)
+        rec_auto = recall_score(y[src_mask], preds, pos_label=1)
+        rec_circle = recall_score(y[src_mask], preds, pos_label=0)
+        n_preds_auto = int((preds == 1).sum())
+        n_preds_circle = int((preds == 0).sum())
 
-        print(f"  {src:<20} {n_src_auto:>8} {n_src_circle:>10} {acc*100:>9.1f}% {n_train:>10}")
+        # Flag unreliable: <5 in either class in test set
+        reliable = n_src_auto >= 5 and n_src_circle >= 5
+        flag = "" if reliable else f"*** N={min(n_src_auto, n_src_circle)} — unreliable ***"
+
+        print(f"  {src:<20} {n_src_auto:>7} {n_src_circle:>7} {acc*100:>8.1f}%"
+              f" {rec_auto*100:>9.1f}% {rec_circle*100:>9.1f}% {n_train:>8} {flag}")
 
         source_results.append({
             "source": src,
             "n_autograph": n_src_auto,
             "n_circle": n_src_circle,
             "bal_acc": round(acc, 4),
+            "recall_auto": round(rec_auto, 4),
+            "recall_circle": round(rec_circle, 4),
+            "n_preds_auto": n_preds_auto,
+            "n_preds_circle": n_preds_circle,
             "n_train": n_train,
+            "reliable": reliable,
         })
 
-    # Verdict
-    if len(source_results) == 0:
+    # --- Reverse direction: train on largest source, test on rest ---
+    reverse_result = None
+    if len(src_counts) >= 2:
+        largest_src = src_counts.most_common(1)[0][0]
+        train_mask_rev = sources == largest_src
+        test_mask_rev = ~train_mask_rev
+
+        n_train_rev = int(train_mask_rev.sum())
+        n_test_rev = int(test_mask_rev.sum())
+        n_test_auto = int((y[test_mask_rev] == 1).sum())
+        n_test_circle = int((y[test_mask_rev] == 0).sum())
+
+        if (n_test_auto > 0 and n_test_circle > 0
+                and (y[train_mask_rev] == 1).sum() > 0
+                and (y[train_mask_rev] == 0).sum() > 0):
+            pca_rev = PCA(n_components=min(20, n_train_rev - 1), random_state=42)
+            X_train_rev = pca_rev.fit_transform(X[train_mask_rev])
+            X_test_rev = pca_rev.transform(X[test_mask_rev])
+
+            clf_rev = SVC(kernel="rbf", C=1.0, gamma="scale", class_weight="balanced")
+            clf_rev.fit(X_train_rev, y[train_mask_rev])
+            preds_rev = clf_rev.predict(X_test_rev)
+            acc_rev = balanced_accuracy_score(y[test_mask_rev], preds_rev)
+            rec_auto_rev = recall_score(y[test_mask_rev], preds_rev, pos_label=1)
+            rec_circle_rev = recall_score(y[test_mask_rev], preds_rev, pos_label=0)
+
+            reverse_result = {
+                "train_source": largest_src,
+                "n_train": n_train_rev,
+                "n_test": n_test_rev,
+                "n_test_auto": n_test_auto,
+                "n_test_circle": n_test_circle,
+                "bal_acc": round(acc_rev, 4),
+                "recall_auto": round(rec_auto_rev, 4),
+                "recall_circle": round(rec_circle_rev, 4),
+            }
+
+            print(f"\n  Reverse: train on {largest_src} ({n_train_rev})"
+                  f" → test on rest ({n_test_rev})")
+            print(f"    Bal Acc: {acc_rev*100:.1f}%  "
+                  f"Rec(auto): {rec_auto_rev*100:.1f}%  "
+                  f"Rec(circle): {rec_circle_rev*100:.1f}%")
+
+    # Verdict — exclude unreliable sources
+    reliable_results = [r for r in source_results if r["reliable"]]
+    if len(reliable_results) == 0:
         verdict = "NO_ELIGIBLE_SOURCES"
     else:
-        accs = [r["bal_acc"] for r in source_results]
+        accs = [r["bal_acc"] for r in reliable_results]
         if all(a > 0.55 for a in accs):
             verdict = "STABLE"
         elif any(a < 0.50 for a in accs):
@@ -2920,7 +3004,7 @@ def domain_shift_test():
             verdict = "VARIABLE"
 
     print(f"\n{'=' * 60}")
-    print(f"  Verdict: {verdict}")
+    print(f"  Verdict: {verdict} (based on {len(reliable_results)} reliable sources)")
     print(f"{'=' * 60}")
 
     output = {
@@ -2929,6 +3013,7 @@ def domain_shift_test():
         "n_circle": n - int(y.sum()),
         "source_counts": dict(src_counts),
         "sources": source_results,
+        "reverse": reverse_result,
         "verdict": verdict,
     }
     with open(RESULTS_DOMAIN_SHIFT_JSON, "w") as f:

@@ -596,14 +596,13 @@ class TestCalibration:
         assert results_path.exists()
         import json
         result = json.loads(results_path.read_text())
-        assert "brier_score" in result
-        assert 0 <= result["brier_score"] <= 1
-        assert "ece_10bin" in result
-        assert "sweep" in result
-        assert len(result["sweep"]) > 0
+        assert "decision_thresholds" in result
+        assert len(result["decision_thresholds"]) > 0
+        assert "baseline_bal_acc" in result
+        assert result["baseline_bal_acc"] > 0.5  # separable synthetic data
 
     def test_coverage_monotonically_decreasing(self, tmp_path, monkeypatch):
-        """Higher threshold → fewer called → lower coverage."""
+        """Higher |d(x)| threshold → fewer called → lower coverage."""
         import scan
 
         emb_path = self._make_synthetic_embeddings(tmp_path)
@@ -616,7 +615,7 @@ class TestCalibration:
 
         import json
         result = json.loads(results_path.read_text())
-        coverages = [s["coverage_pct"] for s in result["sweep"]]
+        coverages = [s["coverage_pct"] for s in result["decision_thresholds"]]
         for i in range(1, len(coverages)):
             assert coverages[i] <= coverages[i - 1], (
                 f"Coverage should decrease: {coverages}")
@@ -673,6 +672,14 @@ class TestHardNegatives:
         assert len(result["subsets"]) == 4  # 100, 75, 50, 25
         assert "verdict" in result
         assert result["verdict"] in ("ROBUST", "DEGRADED", "COLLAPSED")
+        # Per-class recall in each subset
+        for sub in result["subsets"]:
+            assert "recall_auto" in sub
+            assert "recall_circle" in sub
+            assert "raw_acc" in sub
+        # Permutation test on top-25%
+        top25 = result["subsets"][-1]
+        assert "perm_p" in top25
 
     def test_cosine_sims_computed(self, tmp_path, monkeypatch):
         """Similarity stats should be valid cosine values."""
@@ -766,9 +773,11 @@ class TestDomainShift:
         assert "sources" in result
         assert "verdict" in result
         assert result["verdict"] in ("STABLE", "VARIABLE", "BROKEN", "NO_ELIGIBLE_SOURCES")
+        # Reverse direction section
+        assert "reverse" in result
 
     def test_per_source_results(self, tmp_path, monkeypatch):
-        """Each eligible source should have accuracy and train size."""
+        """Each eligible source should have accuracy, recall, and reliability flag."""
         import scan
 
         inv_path, emb_path = self._make_synthetic_data(tmp_path)
@@ -788,3 +797,7 @@ class TestDomainShift:
             assert 0 <= src["bal_acc"] <= 1
             assert "n_train" in src
             assert src["n_train"] > 0
+            assert "recall_auto" in src
+            assert "recall_circle" in src
+            assert "reliable" in src
+            assert isinstance(src["reliable"], bool)
