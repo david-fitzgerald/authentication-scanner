@@ -11,6 +11,9 @@ from scan import (
     classify_attribution,
     classify_rembrandt_group,
     confounder_audit,
+    calibration_test,
+    hard_negative_test,
+    domain_shift_test,
     dedup_by_phash,
     extract_iiif_id,
     met_artist_group,
@@ -543,3 +546,245 @@ class TestEmbedSingleImage:
         img = Image.new("RGB", (100, 100))  # smaller than 224x224
         result = _embed_single_image(img, None, None, 16, None, entropy=False)
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Calibration + Abstention
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not _has_sklearn, reason="scikit-learn not installed")
+class TestCalibration:
+    """Smoke tests for calibration_test() with synthetic data."""
+
+    def _make_synthetic_embeddings(self, tmp_path, n=200, separable=True):
+        """Create synthetic embeddings with optional class separation."""
+        rng = np.random.RandomState(42)
+        n_auto = n // 2
+        n_circle = n - n_auto
+
+        groups = (["rembrandt_autograph"] * n_auto
+                  + ["rembrandt_circle"] * n_circle)
+        obj_ids = [f"obj_{i}" for i in range(n)]
+
+        emb_dim = 768
+        cls = rng.randn(n, emb_dim).astype(np.float32)
+        if separable:
+            cls[:n_auto] += 1.5  # mild separation
+        patch = rng.randn(n, emb_dim).astype(np.float32)
+
+        emb_path = tmp_path / "embeddings" / "embeddings_entropy.npz"
+        emb_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(emb_path,
+                 painting_ids=np.array(obj_ids),
+                 artist_groups=np.array(groups),
+                 cls_embeddings=cls,
+                 patch_embeddings=patch)
+        return emb_path
+
+    def test_calibration_runs(self, tmp_path, monkeypatch):
+        """Smoke test: calibration_test completes and writes JSON."""
+        import scan
+
+        emb_path = self._make_synthetic_embeddings(tmp_path)
+        results_path = tmp_path / "results_calibration.json"
+
+        monkeypatch.setattr(scan, "EMBEDDINGS_ENTROPY_NPZ", emb_path)
+        monkeypatch.setattr(scan, "RESULTS_CALIBRATION_JSON", results_path)
+
+        calibration_test()
+
+        assert results_path.exists()
+        import json
+        result = json.loads(results_path.read_text())
+        assert "brier_score" in result
+        assert 0 <= result["brier_score"] <= 1
+        assert "ece_10bin" in result
+        assert "sweep" in result
+        assert len(result["sweep"]) > 0
+
+    def test_coverage_monotonically_decreasing(self, tmp_path, monkeypatch):
+        """Higher threshold → fewer called → lower coverage."""
+        import scan
+
+        emb_path = self._make_synthetic_embeddings(tmp_path)
+        results_path = tmp_path / "results_calibration.json"
+
+        monkeypatch.setattr(scan, "EMBEDDINGS_ENTROPY_NPZ", emb_path)
+        monkeypatch.setattr(scan, "RESULTS_CALIBRATION_JSON", results_path)
+
+        calibration_test()
+
+        import json
+        result = json.loads(results_path.read_text())
+        coverages = [s["coverage_pct"] for s in result["sweep"]]
+        for i in range(1, len(coverages)):
+            assert coverages[i] <= coverages[i - 1], (
+                f"Coverage should decrease: {coverages}")
+
+
+# ---------------------------------------------------------------------------
+# Hard-Negative Mining
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not _has_sklearn, reason="scikit-learn not installed")
+class TestHardNegatives:
+    """Smoke tests for hard_negative_test() with synthetic data."""
+
+    def _make_synthetic_embeddings(self, tmp_path, n=200):
+        rng = np.random.RandomState(42)
+        n_auto = n // 2
+        n_circle = n - n_auto
+
+        groups = (["rembrandt_autograph"] * n_auto
+                  + ["rembrandt_circle"] * n_circle)
+        obj_ids = [f"obj_{i}" for i in range(n)]
+
+        emb_dim = 768
+        cls = rng.randn(n, emb_dim).astype(np.float32)
+        patch = rng.randn(n, emb_dim).astype(np.float32)
+
+        emb_path = tmp_path / "embeddings" / "embeddings_entropy.npz"
+        emb_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(emb_path,
+                 painting_ids=np.array(obj_ids),
+                 artist_groups=np.array(groups),
+                 cls_embeddings=cls,
+                 patch_embeddings=patch)
+        return emb_path
+
+    def test_hard_negatives_runs(self, tmp_path, monkeypatch):
+        """Smoke test: hard_negative_test completes and writes JSON."""
+        import scan
+
+        emb_path = self._make_synthetic_embeddings(tmp_path)
+        results_path = tmp_path / "results_hard_negatives.json"
+
+        monkeypatch.setattr(scan, "EMBEDDINGS_ENTROPY_NPZ", emb_path)
+        monkeypatch.setattr(scan, "RESULTS_HARD_NEGATIVES_JSON", results_path)
+
+        hard_negative_test()
+
+        assert results_path.exists()
+        import json
+        result = json.loads(results_path.read_text())
+        assert "similarity_stats" in result
+        assert "mean" in result["similarity_stats"]
+        assert "subsets" in result
+        assert len(result["subsets"]) == 4  # 100, 75, 50, 25
+        assert "verdict" in result
+        assert result["verdict"] in ("ROBUST", "DEGRADED", "COLLAPSED")
+
+    def test_cosine_sims_computed(self, tmp_path, monkeypatch):
+        """Similarity stats should be valid cosine values."""
+        import scan
+
+        emb_path = self._make_synthetic_embeddings(tmp_path)
+        results_path = tmp_path / "results_hard_negatives.json"
+
+        monkeypatch.setattr(scan, "EMBEDDINGS_ENTROPY_NPZ", emb_path)
+        monkeypatch.setattr(scan, "RESULTS_HARD_NEGATIVES_JSON", results_path)
+
+        hard_negative_test()
+
+        import json
+        result = json.loads(results_path.read_text())
+        stats = result["similarity_stats"]
+        # Cosine similarity range is [-1, 1]
+        assert -1 <= stats["min"] <= 1
+        assert -1 <= stats["max"] <= 1
+        assert stats["min"] <= stats["mean"] <= stats["max"]
+
+
+# ---------------------------------------------------------------------------
+# Domain-Shift Holdout
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not _has_sklearn, reason="scikit-learn not installed")
+class TestDomainShift:
+    """Smoke tests for domain_shift_test() with synthetic data."""
+
+    def _make_synthetic_data(self, tmp_path, n=200):
+        import csv as csv_mod
+
+        rng = np.random.RandomState(42)
+        # Two sources with >=10 paintings each
+        sources = (["wikidata"] * (n - 40)
+                   + ["rijksmuseum"] * 20
+                   + ["met"] * 20)
+        groups = (["rembrandt_autograph"] * (n // 2)
+                  + ["rembrandt_circle"] * (n - n // 2))
+        obj_ids = [f"obj_{i}" for i in range(n)]
+
+        order = rng.permutation(n)
+        sources = [sources[i] for i in order]
+        groups = [groups[i] for i in order]
+        obj_ids = [obj_ids[i] for i in order]
+
+        inv_path = tmp_path / "metadata" / "inventory.csv"
+        inv_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(inv_path, "w", newline="") as f:
+            w = csv_mod.DictWriter(f, fieldnames=["obj_id", "source", "title",
+                                                   "creator", "date", "image_url",
+                                                   "artist_group", "attribution"])
+            w.writeheader()
+            for i in range(n):
+                w.writerow({"obj_id": obj_ids[i], "source": sources[i],
+                            "title": "", "creator": "", "date": "",
+                            "image_url": "", "artist_group": groups[i],
+                            "attribution": ""})
+
+        emb_dim = 768
+        cls = rng.randn(n, emb_dim).astype(np.float32)
+        patch = rng.randn(n, emb_dim).astype(np.float32)
+
+        emb_path = tmp_path / "embeddings" / "embeddings_entropy.npz"
+        emb_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(emb_path,
+                 painting_ids=np.array(obj_ids),
+                 artist_groups=np.array(groups),
+                 cls_embeddings=cls,
+                 patch_embeddings=patch)
+
+        return inv_path, emb_path
+
+    def test_domain_shift_runs(self, tmp_path, monkeypatch):
+        """Smoke test: domain_shift_test completes and writes JSON."""
+        import scan
+
+        inv_path, emb_path = self._make_synthetic_data(tmp_path)
+        results_path = tmp_path / "results_domain_shift.json"
+
+        monkeypatch.setattr(scan, "INVENTORY_CSV", inv_path)
+        monkeypatch.setattr(scan, "EMBEDDINGS_ENTROPY_NPZ", emb_path)
+        monkeypatch.setattr(scan, "RESULTS_DOMAIN_SHIFT_JSON", results_path)
+
+        domain_shift_test()
+
+        assert results_path.exists()
+        import json
+        result = json.loads(results_path.read_text())
+        assert "sources" in result
+        assert "verdict" in result
+        assert result["verdict"] in ("STABLE", "VARIABLE", "BROKEN", "NO_ELIGIBLE_SOURCES")
+
+    def test_per_source_results(self, tmp_path, monkeypatch):
+        """Each eligible source should have accuracy and train size."""
+        import scan
+
+        inv_path, emb_path = self._make_synthetic_data(tmp_path)
+        results_path = tmp_path / "results_domain_shift.json"
+
+        monkeypatch.setattr(scan, "INVENTORY_CSV", inv_path)
+        monkeypatch.setattr(scan, "EMBEDDINGS_ENTROPY_NPZ", emb_path)
+        monkeypatch.setattr(scan, "RESULTS_DOMAIN_SHIFT_JSON", results_path)
+
+        domain_shift_test()
+
+        import json
+        result = json.loads(results_path.read_text())
+        for src in result["sources"]:
+            assert "source" in src
+            assert "bal_acc" in src
+            assert 0 <= src["bal_acc"] <= 1
+            assert "n_train" in src
+            assert src["n_train"] > 0

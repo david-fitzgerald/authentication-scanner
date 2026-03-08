@@ -58,6 +58,9 @@ RESULTS_LORA_JSON = CACHE_DIR / "results_lora.json"
 RESULTS_LORA_TRANSFER_JSON = CACHE_DIR / "results_lora_transfer.json"
 RESULTS_LORA_CURRICULUM_JSON = CACHE_DIR / "results_lora_curriculum.json"
 RESULTS_ROBUSTNESS_JSON = CACHE_DIR / "results_robustness.json"
+RESULTS_CALIBRATION_JSON = CACHE_DIR / "results_calibration.json"
+RESULTS_HARD_NEGATIVES_JSON = CACHE_DIR / "results_hard_negatives.json"
+RESULTS_DOMAIN_SHIFT_JSON = CACHE_DIR / "results_domain_shift.json"
 
 TILE_SIZE = 224
 IMG_MAX_PX = 2000        # v1 low-res cap
@@ -2556,6 +2559,384 @@ def robustness_test():
 
 
 # ---------------------------------------------------------------------------
+# Experiment: Calibration + Abstention
+# ---------------------------------------------------------------------------
+
+def calibration_test():
+    """Calibrated probabilities + abstention threshold sweep.
+
+    Wrap best SVM RBF in CalibratedClassifierCV (isotonic, cv=10),
+    sweep abstention thresholds, report accuracy-vs-coverage tradeoff.
+    """
+    from sklearn.calibration import CalibratedClassifierCV
+    from sklearn.decomposition import PCA
+    from sklearn.metrics import balanced_accuracy_score, brier_score_loss
+    from sklearn.model_selection import StratifiedKFold
+    from sklearn.svm import SVC
+
+    print("\n" + "=" * 60)
+    print("  CALIBRATION + ABSTENTION RESULTS")
+    print("=" * 60)
+
+    if not EMBEDDINGS_ENTROPY_NPZ.exists():
+        print("ERROR: No cached entropy embeddings. Run --entropy pipeline first.")
+        sys.exit(1)
+
+    data = np.load(EMBEDDINGS_ENTROPY_NPZ, allow_pickle=True)
+    artist_groups = data["artist_groups"]
+    cls_emb = data["cls_embeddings"]
+    patch_emb = data["patch_embeddings"]
+
+    mask = np.isin(artist_groups, ["rembrandt_autograph", "rembrandt_circle"])
+    X_all = np.concatenate([cls_emb[mask], patch_emb[mask]], axis=1)
+    y = (artist_groups[mask] == "rembrandt_autograph").astype(int)
+    n = len(y)
+    print(f"  Dataset: {n} paintings ({int(y.sum())} autograph + {n - int(y.sum())} circle)")
+
+    pca = PCA(n_components=20, random_state=42)
+    X = pca.fit_transform(X_all)
+
+    # Collect out-of-fold calibrated probabilities via 10-fold CV
+    outer_cv = StratifiedKFold(n_splits=10, shuffle=True, random_state=42)
+    oof_probs = np.zeros(n)
+    oof_preds = np.zeros(n, dtype=int)
+
+    for fold, (train_idx, test_idx) in enumerate(outer_cv.split(X, y)):
+        base_clf = SVC(kernel="rbf", C=1.0, gamma="scale", class_weight="balanced")
+        cal_clf = CalibratedClassifierCV(base_clf, cv=5, method="isotonic")
+        cal_clf.fit(X[train_idx], y[train_idx])
+        probs = cal_clf.predict_proba(X[test_idx])
+        oof_probs[test_idx] = probs[:, 1]  # P(autograph)
+        oof_preds[test_idx] = cal_clf.predict(X[test_idx])
+
+    # Baseline balanced accuracy (no abstention)
+    baseline_bal_acc = balanced_accuracy_score(y, oof_preds)
+    brier = brier_score_loss(y, oof_probs)
+
+    # ECE (expected calibration error, 10 bins)
+    n_bins = 10
+    bin_edges = np.linspace(0, 1, n_bins + 1)
+    ece = 0.0
+    for i in range(n_bins):
+        in_bin = (oof_probs >= bin_edges[i]) & (oof_probs < bin_edges[i + 1])
+        if in_bin.sum() == 0:
+            continue
+        avg_conf = oof_probs[in_bin].mean()
+        avg_acc = y[in_bin].mean()
+        ece += in_bin.sum() * abs(avg_conf - avg_acc)
+    ece /= n
+
+    # Sweep abstention thresholds
+    thresholds = [t / 100.0 for t in range(50, 100, 5)]
+    sweep_results = []
+
+    print(f"\n  {'Threshold':>10}  {'Coverage':>10}  {'Accuracy':>10}  {'Called/Total':>14}")
+    for thresh in thresholds:
+        # Abstain if max(P(class0), P(class1)) < threshold
+        max_prob = np.maximum(oof_probs, 1 - oof_probs)
+        called_mask = max_prob >= thresh
+        n_called = int(called_mask.sum())
+        coverage = n_called / n
+
+        if n_called == 0:
+            acc = 0.0
+        else:
+            acc = balanced_accuracy_score(y[called_mask], oof_preds[called_mask])
+
+        sweep_results.append({
+            "threshold": thresh,
+            "coverage_pct": round(coverage * 100, 1),
+            "accuracy_pct": round(acc * 100, 1),
+            "n_called": n_called,
+            "n_total": n,
+        })
+        print(f"  {thresh:>10.2f}  {coverage*100:>9.1f}%  {acc*100:>9.1f}%  {n_called:>6}/{n}")
+
+    print(f"\n{'=' * 60}")
+    print(f"  Brier score: {brier:.4f}")
+    print(f"  ECE (10-bin): {ece:.4f}")
+    print(f"  Baseline balanced accuracy: {baseline_bal_acc:.4f}")
+    print(f"{'=' * 60}")
+
+    output = {
+        "n_total": n,
+        "n_autograph": int(y.sum()),
+        "n_circle": n - int(y.sum()),
+        "baseline_bal_acc": round(baseline_bal_acc, 4),
+        "brier_score": round(brier, 4),
+        "ece_10bin": round(ece, 4),
+        "sweep": sweep_results,
+    }
+    with open(RESULTS_CALIBRATION_JSON, "w") as f:
+        json.dump(output, f, indent=2)
+    print(f"\n  Saved → {RESULTS_CALIBRATION_JSON}")
+
+
+# ---------------------------------------------------------------------------
+# Experiment: Hard-Negative Mining
+# ---------------------------------------------------------------------------
+
+def hard_negative_test():
+    """Test discrimination on circle paintings most similar to autographs.
+
+    Compute cosine similarity, rank circle by hardness, re-run probe
+    on progressively harder subsets.
+    """
+    from sklearn.decomposition import PCA
+    from sklearn.metrics.pairwise import cosine_similarity
+    from sklearn.model_selection import StratifiedKFold, cross_val_score
+    from sklearn.svm import SVC
+
+    print("\n" + "=" * 60)
+    print("  HARD-NEGATIVE ANALYSIS")
+    print("=" * 60)
+
+    if not EMBEDDINGS_ENTROPY_NPZ.exists():
+        print("ERROR: No cached entropy embeddings. Run --entropy pipeline first.")
+        sys.exit(1)
+
+    data = np.load(EMBEDDINGS_ENTROPY_NPZ, allow_pickle=True)
+    artist_groups = data["artist_groups"]
+    cls_emb = data["cls_embeddings"]
+    patch_emb = data["patch_embeddings"]
+
+    mask = np.isin(artist_groups, ["rembrandt_autograph", "rembrandt_circle"])
+    X_all = np.concatenate([cls_emb[mask], patch_emb[mask]], axis=1)
+    groups = artist_groups[mask]
+
+    auto_mask = groups == "rembrandt_autograph"
+    circle_mask = groups == "rembrandt_circle"
+    X_auto = X_all[auto_mask]
+    X_circle = X_all[circle_mask]
+    n_auto = int(auto_mask.sum())
+    n_circle = int(circle_mask.sum())
+
+    print(f"  Dataset: {n_auto} autograph + {n_circle} circle")
+
+    # Cosine similarity: each circle vs all autographs
+    sim_matrix = cosine_similarity(X_circle, X_auto)  # (n_circle, n_auto)
+    max_sim = sim_matrix.max(axis=1)  # (n_circle,)
+
+    print("\n  Circle similarity to nearest autograph:")
+    print(f"    mean={max_sim.mean():.4f}  std={max_sim.std():.4f}  "
+          f"min={max_sim.min():.4f}  max={max_sim.max():.4f}")
+
+    # Sort circle indices by max similarity (descending = hardest)
+    hardness_order = np.argsort(-max_sim)
+
+    # Sweep percentiles
+    percentiles = [100, 75, 50, 25]
+    subset_results = []
+
+    # Full-dataset baseline
+    y_full = (groups == "rembrandt_autograph").astype(int)
+    pca_full = PCA(n_components=20, random_state=42)
+    X_full_pca = pca_full.fit_transform(X_all)
+    skf = StratifiedKFold(n_splits=10, shuffle=True, random_state=42)
+    baseline_scores = cross_val_score(
+        SVC(kernel="rbf", C=1.0, gamma="scale", class_weight="balanced"),
+        X_full_pca, y_full, cv=skf, scoring="balanced_accuracy")
+    baseline_acc = baseline_scores.mean()
+
+    print(f"\n  {'Subset':<20} {'N_circle':>10} {'Bal Acc':>10} {'vs Full':>10}")
+
+    for pct in percentiles:
+        n_keep = max(1, int(n_circle * pct / 100))
+        hard_indices = hardness_order[:n_keep]
+
+        # Build subset: all autographs + selected hard circle paintings
+        # Get indices into X_all
+        circle_global_idx = np.where(circle_mask)[0]
+        auto_global_idx = np.where(auto_mask)[0]
+        subset_idx = np.concatenate([auto_global_idx, circle_global_idx[hard_indices]])
+
+        X_sub = X_all[subset_idx]
+        y_sub = (groups[subset_idx] == "rembrandt_autograph").astype(int)
+
+        n_sub_circle = n_keep
+        n_sub = len(y_sub)
+
+        # Need enough samples for 10-fold CV
+        n_splits = min(10, min(int(y_sub.sum()), n_sub - int(y_sub.sum())))
+        if n_splits < 2:
+            acc = float("nan")
+            delta = float("nan")
+        else:
+            pca_sub = PCA(n_components=min(20, n_sub - 1), random_state=42)
+            X_sub_pca = pca_sub.fit_transform(X_sub)
+            skf_sub = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+            scores = cross_val_score(
+                SVC(kernel="rbf", C=1.0, gamma="scale", class_weight="balanced"),
+                X_sub_pca, y_sub, cv=skf_sub, scoring="balanced_accuracy")
+            acc = scores.mean()
+            delta = acc - baseline_acc
+
+        label = f"Top {pct}%" if pct < 100 else "All circle"
+        print(f"  {label:<20} {n_sub_circle:>10} {acc*100:>9.1f}% {delta*100:>+9.1f}%")
+
+        subset_results.append({
+            "percentile": pct,
+            "n_circle": n_sub_circle,
+            "bal_acc": round(acc, 4) if not np.isnan(acc) else None,
+            "delta_vs_full": round(delta, 4) if not np.isnan(delta) else None,
+        })
+
+    # Verdict
+    top25_acc = subset_results[-1]["bal_acc"]
+    if top25_acc is None or top25_acc < 0.50:
+        verdict = "COLLAPSED"
+    elif top25_acc < 0.55:
+        verdict = "DEGRADED"
+    else:
+        verdict = "ROBUST"
+
+    print(f"\n{'=' * 60}")
+    print(f"  Verdict: {verdict}")
+    print(f"{'=' * 60}")
+
+    output = {
+        "n_autograph": n_auto,
+        "n_circle": n_circle,
+        "similarity_stats": {
+            "mean": round(float(max_sim.mean()), 4),
+            "std": round(float(max_sim.std()), 4),
+            "min": round(float(max_sim.min()), 4),
+            "max": round(float(max_sim.max()), 4),
+        },
+        "baseline_bal_acc": round(baseline_acc, 4),
+        "subsets": subset_results,
+        "verdict": verdict,
+    }
+    with open(RESULTS_HARD_NEGATIVES_JSON, "w") as f:
+        json.dump(output, f, indent=2)
+    print(f"\n  Saved → {RESULTS_HARD_NEGATIVES_JSON}")
+
+
+# ---------------------------------------------------------------------------
+# Experiment: Domain-Shift Holdout
+# ---------------------------------------------------------------------------
+
+def domain_shift_test():
+    """Train on all sources except one, test on held-out source.
+
+    For each source with >=10 paintings in {autograph, circle},
+    train on all other sources, test on held-out.
+    """
+    import csv as csv_mod
+    from sklearn.decomposition import PCA
+    from sklearn.metrics import balanced_accuracy_score
+    from sklearn.svm import SVC
+
+    print("\n" + "=" * 60)
+    print("  DOMAIN-SHIFT HOLDOUT RESULTS")
+    print("=" * 60)
+
+    if not INVENTORY_CSV.exists():
+        print("ERROR: No cached inventory. Run full pipeline first.")
+        sys.exit(1)
+    if not EMBEDDINGS_ENTROPY_NPZ.exists():
+        print("ERROR: No cached entropy embeddings. Run --entropy pipeline first.")
+        sys.exit(1)
+
+    with open(INVENTORY_CSV) as f:
+        rows = list(csv_mod.DictReader(f))
+    source_by_id = {r["obj_id"]: r["source"] for r in rows}
+
+    data = np.load(EMBEDDINGS_ENTROPY_NPZ, allow_pickle=True)
+    painting_ids = data["painting_ids"]
+    artist_groups = data["artist_groups"]
+    cls_emb = data["cls_embeddings"]
+    patch_emb = data["patch_embeddings"]
+
+    mask = np.isin(artist_groups, ["rembrandt_autograph", "rembrandt_circle"])
+    X = np.concatenate([cls_emb[mask], patch_emb[mask]], axis=1)
+    y = (artist_groups[mask] == "rembrandt_autograph").astype(int)
+    ids = painting_ids[mask]
+    sources = np.array([source_by_id.get(pid, "unknown") for pid in ids])
+
+    n = len(y)
+    print(f"  Dataset: {n} paintings ({int(y.sum())} autograph + {n - int(y.sum())} circle)")
+
+    from collections import Counter
+    src_counts = Counter(sources)
+    for s, c in src_counts.most_common():
+        print(f"    {s}: {c}")
+
+    # Find eligible sources (>=10 paintings total in autograph+circle)
+    unique_sources = sorted(set(sources))
+    source_results = []
+
+    print(f"\n  {'Source':<20} {'N_auto':>8} {'N_circle':>10} {'Bal Acc':>10} {'Train N':>10}")
+
+    for src in unique_sources:
+        src_mask = sources == src
+        n_src = int(src_mask.sum())
+        n_src_auto = int((src_mask & (y == 1)).sum())
+        n_src_circle = int((src_mask & (y == 0)).sum())
+
+        if n_src < 10:
+            continue
+        # Need both classes in test
+        if n_src_auto == 0 or n_src_circle == 0:
+            continue
+
+        # Train on other sources, test on this
+        train_mask = ~src_mask
+        n_train = int(train_mask.sum())
+
+        # Need both classes in train
+        if (y[train_mask] == 1).sum() == 0 or (y[train_mask] == 0).sum() == 0:
+            continue
+
+        pca = PCA(n_components=min(20, n_train - 1), random_state=42)
+        X_train = pca.fit_transform(X[train_mask])
+        X_test = pca.transform(X[src_mask])
+
+        clf = SVC(kernel="rbf", C=1.0, gamma="scale", class_weight="balanced")
+        clf.fit(X_train, y[train_mask])
+        preds = clf.predict(X_test)
+        acc = balanced_accuracy_score(y[src_mask], preds)
+
+        print(f"  {src:<20} {n_src_auto:>8} {n_src_circle:>10} {acc*100:>9.1f}% {n_train:>10}")
+
+        source_results.append({
+            "source": src,
+            "n_autograph": n_src_auto,
+            "n_circle": n_src_circle,
+            "bal_acc": round(acc, 4),
+            "n_train": n_train,
+        })
+
+    # Verdict
+    if len(source_results) == 0:
+        verdict = "NO_ELIGIBLE_SOURCES"
+    else:
+        accs = [r["bal_acc"] for r in source_results]
+        if all(a > 0.55 for a in accs):
+            verdict = "STABLE"
+        elif any(a < 0.50 for a in accs):
+            verdict = "BROKEN"
+        else:
+            verdict = "VARIABLE"
+
+    print(f"\n{'=' * 60}")
+    print(f"  Verdict: {verdict}")
+    print(f"{'=' * 60}")
+
+    output = {
+        "n_total": n,
+        "n_autograph": int(y.sum()),
+        "n_circle": n - int(y.sum()),
+        "source_counts": dict(src_counts),
+        "sources": source_results,
+        "verdict": verdict,
+    }
+    with open(RESULTS_DOMAIN_SHIFT_JSON, "w") as f:
+        json.dump(output, f, indent=2)
+    print(f"\n  Saved → {RESULTS_DOMAIN_SHIFT_JSON}")
+
+
+# ---------------------------------------------------------------------------
 # Option I: Fine-tune DINOv2
 # ---------------------------------------------------------------------------
 
@@ -4057,6 +4438,12 @@ def main():
                         help="Run confounder audit: source classifier + within-source probes")
     parser.add_argument("--robustness-test", action="store_true",
                         help="Test prediction stability under benign image augmentations")
+    parser.add_argument("--calibration", action="store_true",
+                        help="Calibrated probabilities + abstention threshold sweep")
+    parser.add_argument("--hard-negatives", action="store_true",
+                        help="Hard-negative mining: probe on hardest circle subsets")
+    parser.add_argument("--domain-shift", action="store_true",
+                        help="Domain-shift holdout: train on N-1 sources, test on held-out")
     args = parser.parse_args()
     hires = args.hires
     model_name = args.model
@@ -4093,6 +4480,21 @@ def main():
     # --robustness-test: augmentation flip rate test, exit
     if args.robustness_test:
         robustness_test()
+        return
+
+    # --calibration: calibrated probabilities + abstention sweep, exit
+    if args.calibration:
+        calibration_test()
+        return
+
+    # --hard-negatives: hard-negative mining, exit
+    if args.hard_negatives:
+        hard_negative_test()
+        return
+
+    # --domain-shift: domain-shift holdout, exit
+    if args.domain_shift:
+        domain_shift_test()
         return
 
     # --concat --probe: concatenate all three embedding sets, run probe, exit
