@@ -14,6 +14,10 @@ from scan import (
     calibration_test,
     hard_negative_test,
     domain_shift_test,
+    multimodal_test,
+    build_metadata_features,
+    parse_met_dimensions,
+    parse_date_range,
     dedup_by_phash,
     extract_iiif_id,
     met_artist_group,
@@ -801,3 +805,231 @@ class TestDomainShift:
             assert "recall_circle" in src
             assert "reliable" in src
             assert isinstance(src["reliable"], bool)
+
+
+# ---------------------------------------------------------------------------
+# parse_met_dimensions
+# ---------------------------------------------------------------------------
+
+class TestParseMetDimensions:
+    def test_standard(self):
+        assert parse_met_dimensions("25.4 x 20.3 cm (10 x 8 in.)") == (25.4, 20.3)
+
+    def test_unicode_times(self):
+        assert parse_met_dimensions("30×25 cm") == (30.0, 25.0)
+
+    def test_no_cm(self):
+        assert parse_met_dimensions("10 x 8 in.") == (None, None)
+
+    def test_empty(self):
+        assert parse_met_dimensions("") == (None, None)
+
+    def test_none(self):
+        assert parse_met_dimensions(None) == (None, None)
+
+    def test_decimal(self):
+        assert parse_met_dimensions("91.1 x 77.8 cm") == (91.1, 77.8)
+
+
+# ---------------------------------------------------------------------------
+# parse_date_range
+# ---------------------------------------------------------------------------
+
+class TestParseDateRange:
+    def test_single_year(self):
+        assert parse_date_range("1642") == (1642, 1642)
+
+    def test_range_hyphen(self):
+        assert parse_date_range("1635-1640") == (1635, 1640)
+
+    def test_range_endash(self):
+        assert parse_date_range("1635–1640") == (1635, 1640)
+
+    def test_circa(self):
+        assert parse_date_range("ca. 1638") == (1638, 1638)
+
+    def test_iso(self):
+        assert parse_date_range("1642-01-01T00:00:00Z") == (1642, 1642)
+
+    def test_empty(self):
+        assert parse_date_range("") == (None, None)
+
+    def test_none(self):
+        assert parse_date_range(None) == (None, None)
+
+
+# ---------------------------------------------------------------------------
+# build_metadata_features
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not _has_sklearn, reason="scikit-learn not installed")
+class TestBuildMetadataFeatures:
+    def test_shape_and_names(self):
+        enriched = {
+            "p1": {"height_cm": "100", "width_cm": "80", "medium": "oil on canvas",
+                    "begin_year": "1640", "end_year": "1642", "title": "Night Watch"},
+            "p2": {"height_cm": "", "width_cm": "", "medium": "oil on panel",
+                    "begin_year": "", "end_year": "", "title": "Small Portrait"},
+        }
+        pids = np.array(["p1", "p2"])
+        X, names = build_metadata_features(enriched, pids)
+        assert X.shape == (2, 8)
+        assert len(names) == 8
+
+    def test_panel_canvas_detection(self):
+        enriched = {
+            "p1": {"height_cm": "100", "width_cm": "80", "medium": "oil on canvas",
+                    "begin_year": "1640", "end_year": "1642", "title": "A"},
+            "p2": {"height_cm": "50", "width_cm": "40", "medium": "oil on wood panel",
+                    "begin_year": "1630", "end_year": "1630", "title": "B"},
+        }
+        pids = np.array(["p1", "p2"])
+        X, names = build_metadata_features(enriched, pids)
+        # p1: canvas=1, panel=0
+        assert X[0, names.index("is_canvas")] == 1.0
+        assert X[0, names.index("is_panel")] == 0.0
+        # p2: panel=1, canvas=0
+        assert X[1, names.index("is_panel")] == 1.0
+        assert X[1, names.index("is_canvas")] == 0.0
+
+    def test_missing_imputation(self):
+        """Missing dims/dates should get median-imputed, not NaN."""
+        enriched = {
+            "p1": {"height_cm": "100", "width_cm": "80", "medium": "",
+                    "begin_year": "1640", "end_year": "1640", "title": "A"},
+            "p2": {"height_cm": "", "width_cm": "", "medium": "",
+                    "begin_year": "", "end_year": "", "title": "B"},
+        }
+        pids = np.array(["p1", "p2"])
+        X, names = build_metadata_features(enriched, pids)
+        assert not np.any(np.isnan(X))
+        # p2 has_dimensions should be 0
+        assert X[1, names.index("has_dimensions")] == 0.0
+        assert X[1, names.index("has_date")] == 0.0
+
+    def test_feature_names(self):
+        enriched = {"p1": {"height_cm": "", "width_cm": "", "medium": "",
+                           "begin_year": "", "end_year": "", "title": "Hello World"}}
+        pids = np.array(["p1"])
+        X, names = build_metadata_features(enriched, pids)
+        assert names == ["log_area_cm2", "is_panel", "is_canvas", "date_midpoint",
+                         "date_range", "has_dimensions", "has_date", "title_word_count"]
+        assert X[0, names.index("title_word_count")] == 2.0
+
+
+# ---------------------------------------------------------------------------
+# Multimodal Probe
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not _has_sklearn, reason="scikit-learn not installed")
+class TestMultimodal:
+    """Smoke tests for multimodal_test() with synthetic data."""
+
+    def _make_synthetic_data(self, tmp_path, n=200):
+        import csv as csv_mod
+
+        rng = np.random.RandomState(42)
+        groups = (["rembrandt_autograph"] * (n // 2)
+                  + ["rembrandt_circle"] * (n - n // 2))
+        obj_ids = [f"wd_Q{i}" for i in range(n)]
+
+        order = rng.permutation(n)
+        groups = [groups[i] for i in order]
+        obj_ids = [obj_ids[i] for i in order]
+
+        # Enriched inventory CSV
+        inv_path = tmp_path / "metadata" / "inventory.csv"
+        inv_path.parent.mkdir(parents=True, exist_ok=True)
+        enriched_path = tmp_path / "metadata" / "inventory_enriched.csv"
+
+        fieldnames = ["obj_id", "source", "title", "creator", "date",
+                      "image_url", "artist_group", "attribution",
+                      "label_confidence", "height_cm", "width_cm",
+                      "medium", "begin_year", "end_year"]
+
+        with open(inv_path, "w", newline="") as f:
+            w = csv_mod.DictWriter(f, fieldnames=fieldnames[:9])
+            w.writeheader()
+            for i in range(n):
+                w.writerow({"obj_id": obj_ids[i], "source": "wikidata",
+                            "title": f"Painting {i}", "creator": "Rembrandt",
+                            "date": "", "image_url": "",
+                            "artist_group": groups[i], "attribution": "autograph",
+                            "label_confidence": "high"})
+
+        with open(enriched_path, "w", newline="") as f:
+            w = csv_mod.DictWriter(f, fieldnames=fieldnames)
+            w.writeheader()
+            for i in range(n):
+                w.writerow({"obj_id": obj_ids[i], "source": "wikidata",
+                            "title": f"Painting {i}", "creator": "Rembrandt",
+                            "date": "", "image_url": "",
+                            "artist_group": groups[i], "attribution": "autograph",
+                            "label_confidence": "high",
+                            "height_cm": str(rng.uniform(30, 200)),
+                            "width_cm": str(rng.uniform(20, 150)),
+                            "medium": rng.choice(["oil on canvas", "oil on panel"]),
+                            "begin_year": str(rng.randint(1625, 1665)),
+                            "end_year": str(rng.randint(1625, 1665))})
+
+        emb_dim = 768
+        cls = rng.randn(n, emb_dim).astype(np.float32)
+        patch = rng.randn(n, emb_dim).astype(np.float32)
+
+        emb_path = tmp_path / "embeddings" / "embeddings_entropy.npz"
+        emb_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(emb_path,
+                 painting_ids=np.array(obj_ids),
+                 artist_groups=np.array(groups),
+                 cls_embeddings=cls,
+                 patch_embeddings=patch)
+
+        return inv_path, enriched_path, emb_path
+
+    def test_multimodal_runs(self, tmp_path, monkeypatch):
+        """Smoke test: multimodal_test completes and writes JSON."""
+        import scan
+
+        inv_path, enriched_path, emb_path = self._make_synthetic_data(tmp_path)
+        results_path = tmp_path / "results_multimodal.json"
+
+        monkeypatch.setattr(scan, "INVENTORY_CSV", inv_path)
+        monkeypatch.setattr(scan, "INVENTORY_ENRICHED_CSV", enriched_path)
+        monkeypatch.setattr(scan, "EMBEDDINGS_ENTROPY_NPZ", emb_path)
+        monkeypatch.setattr(scan, "RESULTS_MULTIMODAL_JSON", results_path)
+
+        multimodal_test()
+
+        assert results_path.exists()
+        import json
+        result = json.loads(results_path.read_text())
+        assert "variants" in result
+        assert len(result["variants"]) == 3
+        assert "coverage" in result
+        assert "verdict" in result
+        assert result["verdict"] in ("IMPROVED", "NEUTRAL", "DEGRADED")
+
+    def test_variants_have_metrics(self, tmp_path, monkeypatch):
+        """Each variant should have bal_acc and recall metrics."""
+        import scan
+
+        inv_path, enriched_path, emb_path = self._make_synthetic_data(tmp_path)
+        results_path = tmp_path / "results_multimodal.json"
+
+        monkeypatch.setattr(scan, "INVENTORY_CSV", inv_path)
+        monkeypatch.setattr(scan, "INVENTORY_ENRICHED_CSV", enriched_path)
+        monkeypatch.setattr(scan, "EMBEDDINGS_ENTROPY_NPZ", emb_path)
+        monkeypatch.setattr(scan, "RESULTS_MULTIMODAL_JSON", results_path)
+
+        multimodal_test()
+
+        import json
+        result = json.loads(results_path.read_text())
+        for v in result["variants"]:
+            assert "variant" in v
+            assert "bal_acc" in v
+            assert 0 <= v["bal_acc"] <= 1
+            assert "recall_auto" in v
+            assert "recall_circle" in v
+        # Variant 3 should have permutation p-value
+        assert "perm_p" in result["variants"][2]

@@ -61,6 +61,8 @@ RESULTS_ROBUSTNESS_JSON = CACHE_DIR / "results_robustness.json"
 RESULTS_CALIBRATION_JSON = CACHE_DIR / "results_calibration.json"
 RESULTS_HARD_NEGATIVES_JSON = CACHE_DIR / "results_hard_negatives.json"
 RESULTS_DOMAIN_SHIFT_JSON = CACHE_DIR / "results_domain_shift.json"
+INVENTORY_ENRICHED_CSV = CACHE_META / "inventory_enriched.csv"
+RESULTS_MULTIMODAL_JSON = CACHE_DIR / "results_multimodal.json"
 
 TILE_SIZE = 224
 IMG_MAX_PX = 2000        # v1 low-res cap
@@ -280,6 +282,84 @@ def parse_la_metadata(la_json):
     return result
 
 
+def rk_enrich(obj_ids):
+    """Fetch metadata (dimensions, material, dates) for Rijksmuseum objects.
+
+    Args:
+        obj_ids: list of obj_id strings with "rk_" prefix
+
+    Returns:
+        {obj_id: {"height_cm": float|None, "width_cm": float|None,
+                   "medium": str|None, "begin_year": int|None, "end_year": int|None}}
+    """
+    results = {}
+    for obj_id in obj_ids:
+        rk_id = obj_id.replace("rk_", "")
+        la_url = f"{RK_DATA_URL}/object/{rk_id}"
+        la_json = fetch_json(la_url)
+        if not la_json:
+            continue
+        entry = {"height_cm": None, "width_cm": None,
+                 "medium": None, "begin_year": None, "end_year": None}
+        # Dimensions from Linked Art dimension array
+        for dim in la_json.get("dimension", []):
+            if not isinstance(dim, dict):
+                continue
+            dim_type = ""
+            for cls in dim.get("classified_as", []):
+                if isinstance(cls, dict):
+                    label = cls.get("_label", "").lower()
+                    if "height" in label:
+                        dim_type = "height"
+                    elif "width" in label:
+                        dim_type = "width"
+            unit_ok = False
+            for mu in dim.get("unit", []) if isinstance(dim.get("unit"), list) else [dim.get("unit", {})]:
+                if isinstance(mu, dict) and "centimetre" in mu.get("_label", "").lower():
+                    unit_ok = True
+            val = dim.get("value")
+            if val is not None and unit_ok:
+                try:
+                    val_f = float(val)
+                except (ValueError, TypeError):
+                    continue
+                if dim_type == "height":
+                    entry["height_cm"] = val_f
+                elif dim_type == "width":
+                    entry["width_cm"] = val_f
+        # Material from made_of / classified_as
+        for mat in la_json.get("made_of", []):
+            if isinstance(mat, dict) and "_label" in mat:
+                entry["medium"] = mat["_label"]
+                break
+        if entry["medium"] is None:
+            for mat in la_json.get("classified_as", []):
+                if isinstance(mat, dict):
+                    label = mat.get("_label", "")
+                    if label and label.lower() not in ("painting",):
+                        entry["medium"] = label
+                        break
+        # Dates from produced_by.timespan
+        produced = la_json.get("produced_by", {})
+        if isinstance(produced, dict):
+            ts = produced.get("timespan", {})
+            if isinstance(ts, dict):
+                begin_str = ts.get("begin_of_the_begin", "")
+                end_str = ts.get("end_of_the_end", "")
+                if begin_str:
+                    b, _ = parse_date_range(begin_str)
+                    entry["begin_year"] = b
+                if end_str:
+                    _, e = parse_date_range(end_str)
+                    entry["end_year"] = e
+                if entry["begin_year"] is not None and entry["end_year"] is None:
+                    entry["end_year"] = entry["begin_year"]
+                if entry["end_year"] is not None and entry["begin_year"] is None:
+                    entry["begin_year"] = entry["end_year"]
+        results[obj_id] = entry
+    return results
+
+
 def extract_iiif_id(edm_json):
     """Extract Micrio IIIF identifier from EDM JSON-LD."""
     if not edm_json:
@@ -372,6 +452,75 @@ def met_artist_group(artist_name, artist_prefix, query_group=None):
             return "rembrandt_autograph"
         return "rembrandt_circle"
     return None
+
+
+def met_enrich(obj_ids):
+    """Fetch metadata (dimensions, medium, dates) for Met objects.
+
+    Args:
+        obj_ids: list of obj_id strings with "met_" prefix
+
+    Returns:
+        {obj_id: {"height_cm": float|None, "width_cm": float|None,
+                   "medium": str|None, "begin_year": int|None, "end_year": int|None}}
+    """
+    results = {}
+    for obj_id in obj_ids:
+        met_id = int(obj_id.replace("met_", ""))
+        obj = met_get_object(met_id)
+        if not obj:
+            continue
+        h, w = parse_met_dimensions(obj.get("dimensions", ""))
+        begin = obj.get("objectBeginDate")
+        end = obj.get("objectEndDate")
+        begin_yr = int(begin) if begin is not None else None
+        end_yr = int(end) if end is not None else None
+        results[obj_id] = {
+            "height_cm": h,
+            "width_cm": w,
+            "medium": obj.get("medium") or None,
+            "begin_year": begin_yr,
+            "end_year": end_yr,
+        }
+    return results
+
+
+def parse_met_dimensions(dim_str):
+    """Extract (height_cm, width_cm) from Met dimension string, or (None, None)."""
+    if not dim_str:
+        return None, None
+    m = re.search(r'(\d+\.?\d*)\s*[x×]\s*(\d+\.?\d*)\s*cm', dim_str)
+    if not m:
+        return None, None
+    return float(m.group(1)), float(m.group(2))
+
+
+def parse_date_range(date_str):
+    """Parse date string to (begin_year, end_year) or (None, None).
+
+    Handles: "1642", "1635-1640", "1635–1640", "ca. 1638",
+    ISO "1642-01-01T00:00:00Z".
+    """
+    if not date_str:
+        return None, None
+    s = str(date_str).strip()
+    # ISO format: 1642-01-01T00:00:00Z
+    m = re.match(r'^(\d{4})-\d{2}-\d{2}', s)
+    if m:
+        yr = int(m.group(1))
+        return yr, yr
+    # Strip "ca." / "c." prefix
+    s = re.sub(r'^c(?:a)?\.?\s*', '', s, flags=re.IGNORECASE)
+    # Range: "1635-1640" or "1635–1640"
+    m = re.match(r'^(\d{4})\s*[-–]\s*(\d{4})$', s)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    # Single year: "1642"
+    m = re.match(r'^(\d{4})$', s)
+    if m:
+        yr = int(m.group(1))
+        return yr, yr
+    return None, None
 
 
 # ---------------------------------------------------------------------------
@@ -533,6 +682,58 @@ def wd_fetch_control_paintings():
             count += 1
         print(f"    {artist_name}: {count} paintings")
     return all_results
+
+
+def wd_enrich_batch(qids):
+    """Batch-query Wikidata for dimensions, material, inception date.
+
+    Args:
+        qids: list of Wikidata QIDs (e.g. ["Q12345", "Q67890"])
+
+    Returns:
+        {qid: {"height_cm": float|None, "width_cm": float|None,
+                "medium": str|None, "begin_year": int|None, "end_year": int|None}}
+    """
+    results = {}
+    batch_size = 200
+    for i in range(0, len(qids), batch_size):
+        batch = qids[i:i + batch_size]
+        values_str = " ".join(f"wd:{q}" for q in batch)
+        query = f"""SELECT ?item ?height ?width ?materialLabel ?inception WHERE {{
+  VALUES ?item {{ {values_str} }}
+  OPTIONAL {{ ?item wdt:P2048 ?height . }}
+  OPTIONAL {{ ?item wdt:P2049 ?width . }}
+  OPTIONAL {{ ?item wdt:P186 ?material . }}
+  OPTIONAL {{ ?item wdt:P571 ?inception . }}
+  SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en" . }}
+}}"""
+        bindings = wd_sparql(query)
+        for b in bindings:
+            qid = b["item"]["value"].split("/")[-1]
+            if qid not in results:
+                results[qid] = {"height_cm": None, "width_cm": None,
+                                "medium": None, "begin_year": None, "end_year": None}
+            entry = results[qid]
+            if "height" in b and entry["height_cm"] is None:
+                try:
+                    entry["height_cm"] = float(b["height"]["value"])
+                except (ValueError, TypeError):
+                    pass
+            if "width" in b and entry["width_cm"] is None:
+                try:
+                    entry["width_cm"] = float(b["width"]["value"])
+                except (ValueError, TypeError):
+                    pass
+            if "materialLabel" in b and entry["medium"] is None:
+                val = b["materialLabel"]["value"]
+                if val and not val.startswith("Q"):
+                    entry["medium"] = val
+            if "inception" in b and entry["begin_year"] is None:
+                begin, end = parse_date_range(b["inception"]["value"])
+                entry["begin_year"] = begin
+                entry["end_year"] = end
+
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -2836,6 +3037,337 @@ def hard_negative_test():
 
 
 # ---------------------------------------------------------------------------
+# Metadata Enrichment (for multimodal probe)
+# ---------------------------------------------------------------------------
+
+def enrich_metadata(refetch=False):
+    """Enrich inventory with dimensions, material, dates from source APIs.
+
+    Reads INVENTORY_CSV, queries Wikidata/Met/Rijks for extra fields,
+    writes INVENTORY_ENRICHED_CSV with 14 columns.
+
+    Returns list of enriched row dicts.
+    """
+    import csv as csv_mod
+
+    if INVENTORY_ENRICHED_CSV.exists() and not refetch:
+        with open(INVENTORY_ENRICHED_CSV) as f:
+            rows = list(csv_mod.DictReader(f))
+        print(f"[Enrich] Loaded cached enriched inventory: {len(rows)} paintings")
+        return rows
+
+    if not INVENTORY_CSV.exists():
+        print("ERROR: No cached inventory. Run full pipeline first.")
+        sys.exit(1)
+
+    with open(INVENTORY_CSV) as f:
+        rows = list(csv_mod.DictReader(f))
+
+    print(f"[Enrich] Enriching {len(rows)} paintings with metadata...")
+
+    # Group obj_ids by source prefix
+    wd_qids = [r["obj_id"] for r in rows if r["obj_id"].startswith("wd_")]
+    met_ids = [r["obj_id"] for r in rows if r["obj_id"].startswith("met_")]
+    rk_ids = [r["obj_id"] for r in rows if r["obj_id"].startswith("rk_")]
+
+    # Fetch metadata from each source
+    meta = {}
+    if wd_qids:
+        print(f"  Wikidata: {len(wd_qids)} paintings...")
+        # Strip "wd_" prefix for SPARQL, map back
+        raw_qids = [oid.replace("wd_", "") for oid in wd_qids]
+        wd_meta = wd_enrich_batch(raw_qids)
+        for oid in wd_qids:
+            qid = oid.replace("wd_", "")
+            if qid in wd_meta:
+                meta[oid] = wd_meta[qid]
+
+    if met_ids:
+        print(f"  Met: {len(met_ids)} paintings...")
+        meta.update(met_enrich(met_ids))
+
+    if rk_ids:
+        print(f"  Rijksmuseum: {len(rk_ids)} paintings...")
+        meta.update(rk_enrich(rk_ids))
+
+    # Merge into rows
+    enriched_fields = ["height_cm", "width_cm", "medium", "begin_year", "end_year"]
+    for row in rows:
+        m = meta.get(row["obj_id"], {})
+        for field in enriched_fields:
+            val = m.get(field)
+            row[field] = str(val) if val is not None else ""
+
+    # Coverage stats
+    n = len(rows)
+    n_dims = sum(1 for r in rows if r["height_cm"] and r["width_cm"])
+    n_mat = sum(1 for r in rows if r["medium"])
+    n_date = sum(1 for r in rows if r["begin_year"])
+    print(f"  Coverage: dims={n_dims}/{n} ({n_dims/n*100:.1f}%)"
+          f"  material={n_mat}/{n} ({n_mat/n*100:.1f}%)"
+          f"  date={n_date}/{n} ({n_date/n*100:.1f}%)")
+
+    # Write enriched CSV
+    fieldnames = ["obj_id", "source", "title", "creator", "date", "image_url",
+                  "artist_group", "attribution", "label_confidence",
+                  "height_cm", "width_cm", "medium", "begin_year", "end_year"]
+    with open(INVENTORY_ENRICHED_CSV, "w", newline="") as f:
+        writer = csv_mod.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"  Saved → {INVENTORY_ENRICHED_CSV}")
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Experiment: Multimodal Probe
+# ---------------------------------------------------------------------------
+
+def build_metadata_features(enriched_by_id, painting_ids):
+    """Build metadata feature matrix from enriched inventory.
+
+    Args:
+        enriched_by_id: dict {obj_id: row_dict} from enriched CSV
+        painting_ids: numpy array of obj_ids (from NPZ)
+
+    Returns:
+        (X_meta, feature_names) — X_meta shape (n, 8)
+    """
+    import math
+
+    n = len(painting_ids)
+    feature_names = ["log_area_cm2", "is_panel", "is_canvas", "date_midpoint",
+                     "date_range", "has_dimensions", "has_date", "title_word_count"]
+    X = np.zeros((n, 8), dtype=np.float64)
+
+    # Collect raw values for median imputation
+    areas = []
+    dates = []
+    for pid in painting_ids:
+        row = enriched_by_id.get(str(pid), {})
+        h = row.get("height_cm", "")
+        w = row.get("width_cm", "")
+        if h and w:
+            try:
+                areas.append(float(h) * float(w))
+            except (ValueError, TypeError):
+                pass
+        b = row.get("begin_year", "")
+        e = row.get("end_year", "")
+        if b:
+            try:
+                bf = float(b)
+                ef = float(e) if e else bf
+                dates.append((bf + ef) / 2)
+            except (ValueError, TypeError):
+                pass
+
+    median_area = float(np.median(areas)) if areas else 1.0
+    median_date = float(np.median(dates)) if dates else 1640.0
+
+    for i, pid in enumerate(painting_ids):
+        row = enriched_by_id.get(str(pid), {})
+
+        # Feature 1: log_area_cm2
+        h = row.get("height_cm", "")
+        w = row.get("width_cm", "")
+        has_dims = bool(h and w)
+        if has_dims:
+            try:
+                area = float(h) * float(w)
+            except (ValueError, TypeError):
+                area = median_area
+                has_dims = False
+        else:
+            area = median_area
+        X[i, 0] = math.log(max(area, 1.0))
+
+        # Feature 2-3: is_panel, is_canvas
+        medium = (row.get("medium", "") or "").lower()
+        X[i, 1] = 1.0 if ("panel" in medium or "wood" in medium) else 0.0
+        X[i, 2] = 1.0 if "canvas" in medium else 0.0
+
+        # Feature 4-5: date_midpoint, date_range
+        b = row.get("begin_year", "")
+        e = row.get("end_year", "")
+        has_date = bool(b)
+        if has_date:
+            try:
+                bf = float(b)
+                ef = float(e) if e else bf
+                X[i, 3] = (bf + ef) / 2
+                X[i, 4] = ef - bf
+            except (ValueError, TypeError):
+                X[i, 3] = median_date
+                X[i, 4] = 0.0
+                has_date = False
+        else:
+            X[i, 3] = median_date
+            X[i, 4] = 0.0
+
+        # Feature 6-7: has_dimensions, has_date
+        X[i, 5] = 1.0 if has_dims else 0.0
+        X[i, 6] = 1.0 if has_date else 0.0
+
+        # Feature 8: title_word_count
+        title = row.get("title", "") or ""
+        X[i, 7] = float(len(title.split()))
+
+    return X, feature_names
+
+
+def multimodal_test(refetch=False):
+    """Multimodal probe: embeddings + metadata features.
+
+    Three variants:
+    1. Embeddings only — PCA(20) + SVM RBF (reproduce baseline)
+    2. Metadata only — 8 features, SVM RBF
+    3. Embeddings + metadata — PCA(20) concat with 8 scaled features
+
+    Permutation test on variant 3 only.
+    """
+    from sklearn.decomposition import PCA
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.metrics import balanced_accuracy_score, recall_score
+    from sklearn.model_selection import StratifiedKFold, permutation_test_score
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.svm import SVC
+
+    print("\n" + "=" * 60)
+    print("  MULTIMODAL PROBE RESULTS")
+    print("=" * 60)
+
+    # Auto-enrich if needed
+    enriched_rows = enrich_metadata(refetch=refetch)
+    enriched_by_id = {r["obj_id"]: r for r in enriched_rows}
+
+    if not EMBEDDINGS_ENTROPY_NPZ.exists():
+        print("ERROR: No cached entropy embeddings. Run --entropy pipeline first.")
+        sys.exit(1)
+
+    data = np.load(EMBEDDINGS_ENTROPY_NPZ, allow_pickle=True)
+    painting_ids = data["painting_ids"]
+    artist_groups = data["artist_groups"]
+    cls_emb = data["cls_embeddings"]
+    patch_emb = data["patch_embeddings"]
+
+    mask = np.isin(artist_groups, ["rembrandt_autograph", "rembrandt_circle"])
+    X_emb = np.concatenate([cls_emb[mask], patch_emb[mask]], axis=1)
+    y = (artist_groups[mask] == "rembrandt_autograph").astype(int)
+    pids = painting_ids[mask]
+    n = len(y)
+    n_auto = int(y.sum())
+    n_circle = n - n_auto
+
+    # Coverage stats
+    n_dims = sum(1 for pid in pids
+                 if enriched_by_id.get(str(pid), {}).get("height_cm"))
+    n_mat = sum(1 for pid in pids
+                if enriched_by_id.get(str(pid), {}).get("medium"))
+    n_date = sum(1 for pid in pids
+                 if enriched_by_id.get(str(pid), {}).get("begin_year"))
+
+    print(f"  Dataset: {n} paintings ({n_auto} autograph + {n_circle} circle)")
+    print(f"  Metadata coverage: dims={n_dims/n*100:.1f}%"
+          f"  material={n_mat/n*100:.1f}%"
+          f"  date={n_date/n*100:.1f}%")
+
+    # Build metadata features
+    X_meta_raw, feature_names = build_metadata_features(enriched_by_id, pids)
+    scaler = StandardScaler()
+    X_meta = scaler.fit_transform(X_meta_raw)
+
+    # PCA on embeddings
+    pca = PCA(n_components=20, random_state=42)
+    X_emb_pca = pca.fit_transform(X_emb)
+
+    # Concat for variant 3
+    X_concat = np.concatenate([X_emb_pca, X_meta], axis=1)
+
+    outer_cv = StratifiedKFold(n_splits=10, shuffle=True, random_state=42)
+
+    def oof_eval(X_in, label):
+        """Run 10-fold OOF SVM and return metrics dict."""
+        oof_preds = np.zeros(n, dtype=int)
+        for train_idx, test_idx in outer_cv.split(X_in, y):
+            clf = SVC(kernel="rbf", C=1.0, gamma="scale", class_weight="balanced")
+            clf.fit(X_in[train_idx], y[train_idx])
+            oof_preds[test_idx] = clf.predict(X_in[test_idx])
+        bal_acc = balanced_accuracy_score(y, oof_preds)
+        rec_auto = recall_score(y, oof_preds, pos_label=1)
+        rec_circle = recall_score(y, oof_preds, pos_label=0)
+        return {
+            "variant": label,
+            "bal_acc": round(bal_acc, 4),
+            "recall_auto": round(rec_auto, 4),
+            "recall_circle": round(rec_circle, 4),
+        }
+
+    # Variant 1: Embeddings only
+    v1 = oof_eval(X_emb_pca, "embeddings_only")
+
+    # Variant 2: Metadata only
+    v2 = oof_eval(X_meta, "metadata_only")
+
+    # Variant 3: Embeddings + metadata
+    v3 = oof_eval(X_concat, "embeddings_plus_meta")
+
+    # Permutation test on variant 3
+    _, _, perm_p_val = permutation_test_score(
+        SVC(kernel="rbf", C=1.0, gamma="scale", class_weight="balanced"),
+        X_concat, y, cv=outer_cv, scoring="balanced_accuracy",
+        n_permutations=200, random_state=42)
+    perm_p = round(float(perm_p_val), 4)
+    v3["perm_p"] = perm_p
+
+    # Feature importances via logistic regression
+    lr = LogisticRegression(max_iter=1000, class_weight="balanced", random_state=42)
+    lr.fit(X_meta, y)
+    feat_importance = {name: round(float(coef), 4)
+                       for name, coef in zip(feature_names, lr.coef_[0])}
+
+    # Print results table
+    print(f"\n  {'Variant':<25} {'Bal Acc':>9} {'Rec(auto)':>10} {'Rec(circle)':>12}")
+    for v in [v1, v2, v3]:
+        p_str = f"  (p={v['perm_p']:.3f})" if "perm_p" in v else ""
+        print(f"  {v['variant']:<25} {v['bal_acc']*100:>8.1f}%"
+              f" {v['recall_auto']*100:>9.1f}%"
+              f" {v['recall_circle']*100:>11.1f}%{p_str}")
+
+    # Verdict
+    delta = v3["bal_acc"] - v1["bal_acc"]
+    if delta >= 0.01 and perm_p < 0.05:
+        verdict = "IMPROVED"
+    elif delta <= -0.01:
+        verdict = "DEGRADED"
+    else:
+        verdict = "NEUTRAL"
+
+    print(f"\n  Verdict: {verdict} (embed+meta vs embed-only: {delta*100:+.1f}pp)")
+    print("\n  Feature importances (logistic regression on metadata):")
+    for name, coef in sorted(feat_importance.items(), key=lambda x: abs(x[1]), reverse=True):
+        print(f"    {name:<20} {coef:+.4f}")
+    print(f"\n{'=' * 60}")
+
+    output = {
+        "n_total": n,
+        "n_autograph": n_auto,
+        "n_circle": n_circle,
+        "coverage": {
+            "dimensions_pct": round(n_dims / n * 100, 1),
+            "material_pct": round(n_mat / n * 100, 1),
+            "date_pct": round(n_date / n * 100, 1),
+        },
+        "variants": [v1, v2, v3],
+        "feature_importances": feat_importance,
+        "verdict": verdict,
+    }
+    with open(RESULTS_MULTIMODAL_JSON, "w") as f:
+        json.dump(output, f, indent=2)
+    print(f"\n  Saved → {RESULTS_MULTIMODAL_JSON}")
+
+
+# ---------------------------------------------------------------------------
 # Experiment: Domain-Shift Holdout
 # ---------------------------------------------------------------------------
 
@@ -4529,6 +5061,8 @@ def main():
                         help="Hard-negative mining: probe on hardest circle subsets")
     parser.add_argument("--domain-shift", action="store_true",
                         help="Domain-shift holdout: train on N-1 sources, test on held-out")
+    parser.add_argument("--multimodal", action="store_true",
+                        help="Multimodal probe: concat metadata features with DINOv2 embeddings")
     args = parser.parse_args()
     hires = args.hires
     model_name = args.model
@@ -4540,9 +5074,9 @@ def main():
         d.mkdir(parents=True, exist_ok=True)
 
     if args.refetch:
-        for f in [INVENTORY_CSV, EMBEDDINGS_NPZ, EMBEDDINGS_V2_NPZ,
-                  EMBEDDINGS_VITL_NPZ, EMBEDDINGS_ENTROPY_NPZ,
-                  EMBEDDINGS_ENTROPY_VITL_NPZ]:
+        for f in [INVENTORY_CSV, INVENTORY_ENRICHED_CSV, EMBEDDINGS_NPZ,
+                  EMBEDDINGS_V2_NPZ, EMBEDDINGS_VITL_NPZ,
+                  EMBEDDINGS_ENTROPY_NPZ, EMBEDDINGS_ENTROPY_VITL_NPZ]:
             if f.exists():
                 f.unlink()
                 print(f"  Deleted {f.name}")
@@ -4580,6 +5114,11 @@ def main():
     # --domain-shift: domain-shift holdout, exit
     if args.domain_shift:
         domain_shift_test()
+        return
+
+    # --multimodal: metadata + embeddings probe, exit
+    if args.multimodal:
+        multimodal_test(refetch=args.refetch)
         return
 
     # --concat --probe: concatenate all three embedding sets, run probe, exit
