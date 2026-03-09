@@ -1,82 +1,63 @@
-# Authentication Scanner
+---
+version: 0.1.0
+created: 2026-03-09
+---
 
-AI-driven art authentication screening at collection scale. Uses DINOv2 vision embeddings to detect style differences between confirmed autographs and disputed attributions.
+# Authentication — Executive Briefing
 
-## Status
+## One-liner
 
-**Best result: 63.7% balanced accuracy** (entropy-weighted SVM RBF, frozen DINOv2 features). All frozen-feature options exhausted (Tier 1). Tier 3 multi-artist transfer + LoRA experiments running on GCE T4.
+DINOv2 frozen embeddings can detect "wrong artist" misattributions (p=2e-11) but cannot distinguish master from skilled imitator — the commercially valuable question. Ceiling confirmed at 63.7% balanced accuracy after exhaustive 3-tier search. Project complete.
 
-## What it does
+## Timeline
 
-1. Queries museum APIs (Rijksmuseum, Met, Wikidata SPARQL, NGA, CMA, AIC) for paintings by target artists
-2. Downloads images, tiles into 224x224 patches
-3. Embeds with DINOv2 ViT-B/14 or ViT-L/14 (multiple aggregation strategies)
-4. Classifies autograph vs circle/workshop/pupil via supervised probes (logistic, SVM, MLP, LoRA fine-tuning)
+Feb 26 – Mar 9, 2026 (~12 days)
 
-## Quick start
+## What we built
 
-```bash
-# Local pipeline (MPS/CUDA/CPU auto-detect)
-python scan.py
+A CLI pipeline (`scan.py`) that fetches paintings from 6 museum APIs + Wikidata SPARQL, computes DINOv2 vision embeddings, and runs unsupervised + supervised classification probes. 1,311 paintings across 4 attribution levels (autograph, circle, pupil, dutch_other). 78 tests, CUDA/MPS portable, GCE T4 deployment scripts.
 
-# Specific stage
-python scan.py --stage N
+## What we learned
 
-# High-res mode
-python scan.py --hires
+### The model is a "different artist" detector, not an authenticator
 
-# Transfer corpus (6 artists, ~6K paintings)
-python scan.py --corpus transfer
+| Task | Result | Verdict |
+|------|--------|---------|
+| Autograph vs pupil/other Dutch | p=2e-11, p=3e-10 | Strong — reliably detects different artist |
+| Autograph vs circle | p=0.80 (unsupervised), 63.7% (supervised) | Weak — can't separate master from skilled imitator |
+| Hard negatives (top 25% hardest circle) | 55.1% balanced accuracy, p=0.228 | Dead — no edge on commercially relevant cases |
 
-# LoRA experiments
-python scan.py --lora              # B: LoRA Rembrandt-only
-python scan.py --lora-transfer     # C: LoRA leave-artist-out
-python scan.py --lora-curriculum   # D: Two-phase curriculum
-python scan.py --transfer-probe    # A: Frozen transfer probe
-```
+### Exhaustive search — nothing left to try with frozen embeddings
 
-## GPU deployment
+| Tier | What we tried | Best result |
+|------|---------------|-------------|
+| **Tier 1: Frozen features** | ViT-B mean (59.0%), ViT-L (59.5%), entropy (63.7%), CLIP (62.9%), concat (62.3%), per-tile voting (60.2%), fine-tune (60.0%) | 63.7% |
+| **Tier 2: Diagnostics** | Confounder audit, robustness, calibration, hard-negatives, domain-shift, multimodal | Signal real but marginal; no step change |
+| **Tier 3: LoRA + transfer** | LoRA Rembrandt (60.9%), LoRA leave-artist-out (crashed), curriculum transfer (59.0%) | All underperform frozen 63.7% |
 
-```bash
-# Deploy to GCE T4 (on-demand, 36h cap, auto-deletes)
-bash deploy-gpu.sh
+### Why the competitors can do it (and we can't with this approach)
 
-# Monitor
-gcloud compute ssh auth-experiments --zone=europe-west4-a -- tail -f /var/log/auth-experiments.log
+Art Recognition and Hephaestus train **custom supervised models per artist** on brushstroke-level features. They don't use frozen foundation model embeddings. Our approach traded training time for signal strength — fast validation, but the ceiling is real.
 
-# Pull results
-gsutil -m rsync -r gs://auth-ml-cache/results/ cache/
-```
+Training a custom model would require: months of work, significant GPU compute, tile-level brushstroke annotation, and competing head-to-head with companies that have a 7-year head start + art world relationships + (in Hephaestus's case) an insurance product.
 
-## Corpus
+## Costs
 
-| Source | Data |
-|--------|------|
-| Rijksmuseum | Rembrandt autograph, circle, workshop, school |
-| Met Open Access | Rembrandt + attributed works |
-| Wikidata SPARQL | 6 artists (Rubens, Cranach, Van Dyck, Titian, Hals, Rembrandt) — ~6K paintings |
-| NGA, CMA, AIC | Supplementary attributions |
+- Compute: <$100 (GCE Spot/on-demand T4, ~10 GPU-hours total)
+- Data: $0 (all museum APIs are CC0, no keys)
+- Time: ~12 days part-time
 
-## Results summary
+## Decision
 
-| Approach | Balanced Acc | Notes |
-|----------|-------------|-------|
-| Frozen DINOv2 ViT-B mean (v1) | 59.0% | Baseline probe |
-| Frozen DINOv2 entropy-weighted | **63.7%** | Best frozen result |
-| ViT-L/14 | 59.5% | Model capacity not the bottleneck |
-| CLIP ViT-L/14 | 62.9% | Different foundation, similar ceiling |
-| Fine-tune (14M params) | 60.0% | Overfits by epoch 10 |
-| LoRA Rembrandt (148K params) | 60.9% | Worse than frozen entropy |
+**Complete.** Technical exploration exhausted. The question "can frozen vision embeddings authenticate art?" is definitively answered: no, not at commercially useful accuracy. The research, pipeline, and 33-entry decisions log have reference value for future vision projects.
 
-## Architecture
+## Key artifacts
 
-```
-scan.py          — Local pipeline. Multi-museum fetch, three-tier cache, CUDA/MPS/CPU.
-deploy-gpu.sh    — GCE T4 launcher. Uploads cache, creates VM, auto-destructs.
-startup-gpu.sh   — VM startup. Installs deps, runs experiments, uploads results to GCS.
-prototype.ipynb  — Phase 1 Colab prototype (historical).
-```
-
-## Framing
-
-This is **screening**, not authentication. Flags candidates for expert review. Never claims to authenticate.
+| File | What |
+|------|------|
+| `docs/decisions.md` | 33-entry chronological decisions log |
+| `docs/scan-results.md` | Full experimental results with statistics |
+| `docs/research.md` | Market opportunity landscape |
+| `docs/execution.md` | Competitor deep-dive, pricing benchmarks, risk analysis |
+| `SPEC.md` | Retroactive build contract |
+| `docs/graduation-tracking.md` | Gate documentation |
