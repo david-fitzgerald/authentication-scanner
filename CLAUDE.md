@@ -6,6 +6,14 @@ AI-driven art authentication via DINOv2 embeddings. Collection-scale screening â
 
 Ceiling confirmed at 63.7% balanced accuracy. All 3 tiers exhausted â€” frozen DINOv2 can detect "wrong artist" (p=2e-11) but cannot distinguish master from skilled imitator. Commercially unviable. See `README.md` for full summary. Completed Mar 9, 2026.
 
+## Docker
+
+```bash
+.docker/run.sh projects/complete/authentication
+```
+
+One-time venv setup inside container: `python -m venv .venv && source .venv/bin/activate && pip install -e ".[dev]"`
+
 ## Quick Reference
 
 | Action | Command |
