@@ -20,15 +20,10 @@ One-time venv setup inside container: `python -m venv .venv && source .venv/bin/
 |--------|---------|
 | Run local pipeline | `python scan.py` |
 | Run specific stage | `python scan.py --stage N` |
-| High-res mode (v2) | `python scan.py --hires` |
-| ViT-L/14 model | `python scan.py --model vitl14` |
 | Re-fetch all data | `python scan.py --refetch` |
-| Transfer corpus (fetch+embed) | `python scan.py --corpus transfer` |
-| Exp A: Frozen transfer probe | `python scan.py --transfer-probe` |
-| Exp B: LoRA Rembrandt-only | `python scan.py --lora` |
-| Exp C: LoRA leave-artist-out | `python scan.py --lora-transfer` |
-| Exp D: Two-phase curriculum | `python scan.py --lora-curriculum` |
 | Lint + test | `ruff check . && pytest tests/ -x -q --tb=short` |
+
+Full command list (including completed experiment modes) in git history — see `docs/experiment-results.md` for what was run.
 
 ## Environment
 
@@ -51,17 +46,7 @@ One-time venv setup inside container: `python -m venv .venv && source .venv/bin/
 
 ## Testing
 
-78 tests via pytest (59 local, 19 skip without GPU/network). Cover pipeline stages (fetch, download, embed, analyze), classification probes, GPU portability, and data integrity.
-
-```bash
-pytest tests/ -x -q --tb=short
-```
-
-## Verification
-
-```bash
-ruff check . && pytest tests/ -x -q --tb=short
-```
+78 tests (59 local, 19 skip without GPU/network). Cover pipeline, classification probes, GPU portability, data integrity. Verify: `ruff check . && pytest tests/ -x -q --tb=short`.
 
 ## Conventions
 
