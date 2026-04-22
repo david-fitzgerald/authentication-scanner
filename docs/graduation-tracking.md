@@ -67,10 +67,10 @@ See `SPEC.md` — all 8 sections filled (retroactive, created 2026-03-09).
 
 **HARNESS L1:**
 - [x] Git repo with remote (GitHub private)
-- [x] CLAUDE.md with status line + required sections
+- [x] AGENTS.md with status line + required sections
 - [x] .gitignore covering language artifacts
 - [x] Linter (ruff) configured and passing
 - [x] Package manifest (pyproject.toml)
 - [x] 78 passing tests
 - [x] Pre-commit hook (ruff + pytest)
-- [x] Verification section in CLAUDE.md
+- [x] Verification section in AGENTS.md
