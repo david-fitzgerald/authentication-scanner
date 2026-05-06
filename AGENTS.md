@@ -1,6 +1,10 @@
+Endpoint — project complete. No further work; preserved for reference.
+
 # authentication/ — AI Art Authentication
 
 AI-driven art authentication via DINOv2 embeddings. Collection-scale screening — position as "flag for expert review," never "authenticate." Best result: 63.7% balanced accuracy (entropy SVM RBF, frozen features). All tiers exhausted — frozen DINOv2 is the ceiling.
+
+**Phase:** complete | **Date:** 2026-03-09
 
 ## Serves
 - **Primary:** `research/lost-treasure/` — authentication infrastructure for lost-art recovery
