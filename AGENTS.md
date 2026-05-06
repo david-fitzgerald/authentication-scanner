@@ -2,6 +2,10 @@
 
 AI-driven art authentication via DINOv2 embeddings. Collection-scale screening — position as "flag for expert review," never "authenticate." Best result: 63.7% balanced accuracy (entropy SVM RBF, frozen features). All tiers exhausted — frozen DINOv2 is the ceiling.
 
+## Serves
+- **Primary:** `research/lost-treasure/` — authentication infrastructure for lost-art recovery
+- **Secondary:** `fi/` — payoff angle if commercially viable (ruled out at G5)
+
 ## Status — COMPLETE
 
 Ceiling confirmed at 63.7% balanced accuracy. All 3 tiers exhausted — frozen DINOv2 can detect "wrong artist" (p=2e-11) but cannot distinguish master from skilled imitator. Commercially unviable. See `README.md` for full summary. Completed Mar 9, 2026.
